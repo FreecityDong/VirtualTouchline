@@ -1,0 +1,5 @@
+pygame==2.6.1
+mediapipe==0.10.32
+opencv-python==4.13.0.92
+pillow==12.1.0
+certifi==2026.1.4
