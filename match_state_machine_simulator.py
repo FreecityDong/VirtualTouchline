@@ -3,7 +3,7 @@ import random
 import tkinter as tk
 from dataclasses import dataclass, field
 from tkinter import ttk
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 FEATURE_KEYS = ["AW", "DW", "CN", "HS", "PR", "BS", "TR", "BU"]
@@ -22,6 +22,16 @@ LANES = ["L", "C", "R"]
 LANE_CN = {"L": "左路", "C": "中路", "R": "右路"}
 ZONE_CHAIN = ["DZ", "MC", "AT", "BA", "PA"]
 ZONE_LEVEL_CN = {"DZ": "后场", "MC": "中场", "AT": "前场", "BA": "禁区前沿", "PA": "禁区"}
+TEAM_STATS_KEYS = [
+    "shots",
+    "shots_on_target",
+    "goals",
+    "turnovers",
+    "counterattacks",
+    "freekicks",
+    "penalties",
+    "corners",
+]
 
 
 FORMATIONS: Dict[str, Dict[str, float]] = {
@@ -165,6 +175,34 @@ def pick_lane_with_trace(weights: Tuple[float, float, float]) -> Tuple[str, floa
     return "R", r
 
 
+def pick_lane_excluding_current(weights: Tuple[float, float, float], current_lane: str) -> Tuple[str, float]:
+    lane_to_idx = {"L": 0, "C": 1, "R": 2}
+    candidates = [l for l in LANES if l != current_lane]
+    c_weights = [weights[lane_to_idx[l]] for l in candidates]
+    s = c_weights[0] + c_weights[1]
+    if s <= 1e-8:
+        r = random.random()
+        return (candidates[0] if r < 0.5 else candidates[1]), r
+    r = random.random()
+    threshold = c_weights[0] / s
+    return (candidates[0] if r < threshold else candidates[1]), r
+
+
+def apply_lane_fatigue(
+    weights: Tuple[float, float, float],
+    current_lane: str,
+    lane_streak: int,
+    k_lane_fatigue: float = 0.6,
+) -> Tuple[Tuple[float, float, float], float]:
+    lane_to_idx = {"L": 0, "C": 1, "R": 2}
+    idx = lane_to_idx[current_lane]
+    mask = [1.0, 1.0, 1.0]
+    fatigue_factor = math.exp(-k_lane_fatigue * lane_streak)
+    mask[idx] = fatigue_factor
+    eff = (weights[0] * mask[0], weights[1] * mask[1], weights[2] * mask[2])
+    return normalize_route(eff), fatigue_factor
+
+
 def zone_tuple_to_str(zone: Tuple[str, str]) -> str:
     return f"{zone[0]}_{zone[1]}"
 
@@ -177,6 +215,14 @@ def format_match_time(total_seconds: int) -> str:
     mins = total_seconds // 60
     secs = total_seconds % 60
     return f"{mins:02d}:{secs:02d}"
+
+
+def make_empty_team_stats() -> Dict[str, int]:
+    return {k: 0 for k in TEAM_STATS_KEYS}
+
+
+def make_empty_match_stats() -> Dict[str, Dict[str, int]]:
+    return {"A": make_empty_team_stats(), "B": make_empty_team_stats()}
 
 
 def shot_type_to_cn(shot_type: str) -> str:
@@ -255,6 +301,8 @@ class MatchState:
     zone: Tuple[str, str] = ("MC", "C")
     last_event: str = "开场"
     last_route: str = "中路"
+    lane_streak: int = 0
+    team_stats: Dict[str, Dict[str, int]] = field(default_factory=make_empty_match_stats)
     current_window: int = 0
 
 
@@ -270,6 +318,7 @@ class MatchSimulatorEngine:
     MATCH_DURATION_SECONDS = 90 * 60
     WINDOW_SECONDS = 15 * 60
     STEP_SECONDS = 15
+    LANE_FATIGUE_K = 0.6
 
     def __init__(self) -> None:
         self.state = MatchState()
@@ -335,6 +384,10 @@ class MatchSimulatorEngine:
     def get_snapshot(self) -> Dict[str, object]:
         a_base, a_weight, a_risk, a_route = self._calc_weighted_features("A")
         b_base, b_weight, b_risk, b_route = self._calc_weighted_features("B")
+        stats_copy = {
+            "A": dict(self.state.team_stats["A"]),
+            "B": dict(self.state.team_stats["B"]),
+        }
         return {
             "match_seconds": self.state.match_seconds,
             "score": (self.state.score_a, self.state.score_b),
@@ -342,6 +395,7 @@ class MatchSimulatorEngine:
             "zone": self.state.zone,
             "last_event": self.state.last_event,
             "last_route": self.state.last_route,
+            "stats": stats_copy,
             "window": self.state.current_window,
             "A": {"base": a_base, "weighted": a_weight, "risk": a_risk, "route": a_route, "tactics": self.team_a, "quota": self.quota["A"]},
             "B": {"base": b_base, "weighted": b_weight, "risk": b_risk, "route": b_route, "tactics": self.team_b, "quota": self.quota["B"]},
@@ -460,6 +514,7 @@ class MatchSimulatorEngine:
     ) -> Tuple[str, Dict[str, float], List[str]]:
         _, atk, _, _ = self._calc_weighted_features(attack_team)
         _, dfn, _, _ = self._calc_weighted_features(defend_team)
+        self._inc_stat(attack_team, "shots")
 
         shot_type = self._choose_shot_type(zone[0], set_piece)
         base_xg, bonus = SHOT_TYPES[shot_type]
@@ -492,6 +547,7 @@ class MatchSimulatorEngine:
         )
 
         if r < p_goal:
+            self._inc_stat(attack_team, "shots_on_target")
             self._add_score(attack_team)
             self.state.possession = defend_team
             self.state.zone = ("MC", "C")
@@ -502,6 +558,7 @@ class MatchSimulatorEngine:
             if outcome == "封堵后角球":
                 self.state.zone = ("BA", zone[1])
                 self.state.possession = attack_team
+                self._inc_stat(attack_team, "corners")
             elif outcome == "封堵后界外":
                 self.state.zone = ("AT", zone[1])
                 self.state.possession = attack_team
@@ -517,6 +574,7 @@ class MatchSimulatorEngine:
             result = outcome
             detail.append(f"【结果】{TEAM_CN.get(defend_team, defend_team)}封堵成功，结果：{outcome}")
         else:
+            self._inc_stat(attack_team, "shots_on_target")
             outcome = random.choices(["门将控制", "门将脱手", "门将扑出底线"], weights=[0.55, 0.20, 0.25], k=1)[0]
             if outcome == "门将控制":
                 self.state.possession = defend_team
@@ -544,6 +602,7 @@ class MatchSimulatorEngine:
             else:
                 self.state.possession = attack_team
                 self.state.zone = ("BA", zone[1])
+                self._inc_stat(attack_team, "corners")
             result = outcome
             if outcome != "门将控制":
                 detail.append(f"【结果】{TEAM_CN.get(defend_team, defend_team)}门将处理结果：{outcome}")
@@ -563,6 +622,14 @@ class MatchSimulatorEngine:
             self.state.score_a += 1
         else:
             self.state.score_b += 1
+        self._inc_stat(team, "goals")
+
+    def _inc_stat(self, team: str, key: str, n: int = 1) -> None:
+        if team not in self.state.team_stats:
+            return
+        if key not in self.state.team_stats[team]:
+            return
+        self.state.team_stats[team][key] += n
 
     def _roll_window(self) -> List[str]:
         logs = []
@@ -584,8 +651,15 @@ class MatchSimulatorEngine:
         attack = self.state.possession
         defend = self.opp_team(attack)
         zone = self.state.zone
-        route = self._calc_weighted_features(attack)[3]
-        lane = pick_lane(route)
+        route_raw = self._calc_weighted_features(attack)[3]
+        route_eff, fatigue_factor = apply_lane_fatigue(
+            route_raw,
+            zone[1],
+            self.state.lane_streak,
+            self.LANE_FATIGUE_K,
+        )
+        lane = pick_lane(route_eff)
+        target_same_lane = lane == zone[1]
         self.state.last_route = LANE_CN[lane]
 
         process = self._build_process_factors(attack, defend, zone[0])
@@ -599,13 +673,22 @@ class MatchSimulatorEngine:
         p_out = p_out_base if out_gate else 0.0
 
         zone_mul = {"DZ": 0.45, "MC": 0.65, "AT": 1.00, "BA": 1.25, "PA": 1.45}[zone[0]]
-        p_shot = clamp(shot_prob * zone_mul)
+        # 射门门控：按区域距离/角度衰减，抑制中后场远射频率
+        zone_shot_gate = {"DZ": 0.06, "MC": 0.14, "AT": 0.38, "BA": 0.72, "PA": 1.00}[zone[0]]
+        lane_shot_gate = {"L": 0.88, "C": 1.00, "R": 0.88}[zone[1]]
+        # 终结区加速：进入 BA/PA 时更倾向尽快完成打门
+        shot_endzone_boost = {"DZ": 1.00, "MC": 1.00, "AT": 1.00, "BA": 1.18, "PA": 1.30}[zone[0]]
+        p_shot = clamp(shot_prob * zone_mul * zone_shot_gate * lane_shot_gate * shot_endzone_boost)
         p_penalty = p_foul * (0.22 if zone[0] == "PA" else 0.0)
         p_freekick = p_foul * (1.0 - (0.22 if zone[0] == "PA" else 0.0))
         p_event = clamp(p_penalty + p_freekick + p_shot + p_out, 0.0, 0.92)
 
-        route_bias = 0.20 * ({"L": route[0], "C": route[1], "R": route[2]}[lane] - 1.0 / 3.0)
+        route_bias = 0.20 * ({"L": route_eff[0], "C": route_eff[1], "R": route_eff[2]}[lane] - 1.0 / 3.0)
         raw_advance = clamp(sigmoid(2.0 * (process["f_progress"] - 0.45 + route_bias)) - 0.15)
+        advance_gate = zone[0] != "PA"
+        if not advance_gate:
+            raw_advance = 0.0
+        switch_endzone_factor = {"DZ": 1.00, "MC": 1.00, "AT": 0.92, "BA": 0.68, "PA": 0.50}[zone[0]]
         raw_switch = clamp(
             sigmoid(
                 2.0
@@ -617,7 +700,7 @@ class MatchSimulatorEngine:
                 )
             )
             - 0.20
-        )
+        ) * switch_endzone_factor
         raw_loss = clamp(
             sigmoid(
                 2.0
@@ -639,6 +722,16 @@ class MatchSimulatorEngine:
         else:
             p_advance, p_switch, p_loss = 0.0, 0.0, 0.0
         p_hold = clamp(flow_budget - p_flow)
+        # 在禁区前沿/禁区减少“原地停留”，将机会倾向回灌到射门触发
+        hold_to_shot_ratio = {"DZ": 0.00, "MC": 0.00, "AT": 0.05, "BA": 0.28, "PA": 0.42}[zone[0]]
+        if hold_to_shot_ratio > 0:
+            hold_to_shot = p_hold * hold_to_shot_ratio
+            p_shot_cap = clamp(0.92 - (p_penalty + p_freekick + p_out), 0.0, 0.92)
+            p_shot_new = clamp(p_shot + hold_to_shot, 0.0, p_shot_cap)
+            shot_add = p_shot_new - p_shot
+            p_shot = p_shot_new
+            p_hold = clamp(p_hold - shot_add)
+            p_event = clamp(p_penalty + p_freekick + p_shot + p_out, 0.0, 0.92)
 
         probs = {
             "P_penalty": p_penalty,
@@ -653,6 +746,8 @@ class MatchSimulatorEngine:
             "P_hold": p_hold,
             "ShotProb": shot_prob,
             "Matchup": process["matchup"],
+            "LaneStreakBefore": float(self.state.lane_streak),
+            "TargetSameLane": 1.0 if target_same_lane else 0.0,
         }
 
         th_pen = p_penalty
@@ -663,22 +758,29 @@ class MatchSimulatorEngine:
         r_event = random.random()
 
         detail = [
-            f"【球权】[{format_match_time(self.state.match_seconds)}] 控球方={TEAM_CN.get(attack, attack)}，当前区域={zone_tuple_to_cn(zone)}，路线倾向(左/中/右)={route[0]:.2f}/{route[1]:.2f}/{route[2]:.2f}，本次目标通道={LANE_CN[lane]}",
+            f"【球权】[{format_match_time(self.state.match_seconds)}] 控球方={TEAM_CN.get(attack, attack)}，当前区域={zone_tuple_to_cn(zone)}，路线倾向原始(左/中/右)={route_raw[0]:.2f}/{route_raw[1]:.2f}/{route_raw[2]:.2f}，疲劳后={route_eff[0]:.2f}/{route_eff[1]:.2f}/{route_eff[2]:.2f}，本次目标通道={LANE_CN[lane]}",
             f"【公式】过程因子：组织={process['f_build']:.2f}, 推进={process['f_progress']:.2f}, 入区={process['f_entry']:.2f}, 转换={process['f_transition']:.2f}, 受扰={process['f_disrupt']:.2f}, 对抗修正={process['matchup']:.2f}",
             f"【公式】概率拆分：事件总量={p_event:.2f}(点球={p_penalty:.2f}, 任意球={p_freekick:.2f}, 射门={p_shot:.2f}, 出界={p_out:.2f})；流转总量={p_flow:.2f}(推进={p_advance:.2f}, 转移={p_switch:.2f}, 失误={p_loss:.2f})；停留={p_hold:.2f}",
+            f"【公式】射门门控：ZoneMul={zone_mul:.2f}，ZoneShotGate={zone_shot_gate:.2f}，LaneShotGate={lane_shot_gate:.2f}，EndZoneBoost={shot_endzone_boost:.2f}，ShotProb={shot_prob:.2f}",
+            f"【公式】终结区修正：SwitchFactor={switch_endzone_factor:.2f}，HoldToShotRatio={hold_to_shot_ratio:.2f}",
+            f"【公式】通道疲劳：当前通道={LANE_CN[zone[1]]}，LaneStreak={self.state.lane_streak}，k={self.LANE_FATIGUE_K:.2f}，疲劳因子={fatigue_factor:.3f}",
             f"【公式】出界门控：OutGate(贴边区域)={'是' if out_gate else '否'}，基础出界概率={p_out_base:.2f}，生效后出界概率={p_out:.2f}",
+            f"【公式】推进门控：AdvanceGate(非禁区)={'是' if advance_gate else '否'}",
             f"【随机】主抽样值={r_event:.4f}；判定阈值：点球<{th_pen:.4f}，任意球<{th_fk:.4f}，射门<{th_shot:.4f}，出界<{th_out:.4f}，流转<{th_flow:.4f}，其余=停留",
         ]
         shot_info: Dict[str, float] = {}
+        resample_hit = False
 
         if r_event < th_pen:
             detail.append("【判定】命中区间：点球")
+            self._inc_stat(attack, "penalties")
             result, shot_info, shot_detail = self._resolve_shot(attack, defend, ("PA", zone[1]), process, set_piece="penalty")
             self.state.last_event = f"点球 -> {result}"
             detail.append("【事件】触发：禁区犯规，判罚点球")
             detail.extend(shot_detail)
         elif r_event < th_fk:
             detail.append("【判定】命中区间：任意球")
+            self._inc_stat(attack, "freekicks")
             detail.append("【事件】触发：任意球")
             fk_plan = random.choices(["直接攻门", "传中二点", "短传重启"], weights=[0.36, 0.44, 0.20], k=1)[0]
             detail.append(f"【随机】任意球执行方案={fk_plan}")
@@ -708,6 +810,7 @@ class MatchSimulatorEngine:
                 self.state.possession = attack
                 self.state.zone = ("BA", lane)
                 self.state.last_event = "防守方触球出底线 -> 角球"
+                self._inc_stat(attack, "corners")
                 detail.append("【事件】触发：角球（防守方解围出底线）")
             else:
                 detail.append(
@@ -749,10 +852,19 @@ class MatchSimulatorEngine:
                 self.state.last_event = f"推进成功 -> {zone_tuple_to_cn(self.state.zone)}"
                 detail.append("【结果】流转事件：纵向推进成功")
             elif r_flow < cond_advance + cond_switch:
-                self.state.zone = zone_switch(zone, lane)
+                switch_lane = lane
+                if switch_lane == zone[1]:
+                    switch_lane, r_switch = pick_lane_excluding_current(route_eff, zone[1])
+                    resample_hit = True
+                    detail.append(
+                        f"【规则】同路目标会导致无效横传，已重采样通道：r_switch={r_switch:.4f} -> {LANE_CN[switch_lane]}"
+                    )
+                self.state.zone = zone_switch(zone, switch_lane)
                 self.state.last_event = f"横向转移 -> {zone_tuple_to_cn(self.state.zone)}"
                 detail.append("【结果】流转事件：同层横向转移")
             elif r_flow < cond_advance + cond_switch + cond_loss:
+                self._inc_stat(attack, "turnovers")
+                self._inc_stat(defend, "counterattacks")
                 self.state.possession = defend
                 mirrored = mirror_zone_for_turnover(zone)
                 self.state.zone = mirrored
@@ -766,6 +878,17 @@ class MatchSimulatorEngine:
             self.state.last_event = "节奏停留（原地控球）"
             detail.append("【结果】保持当前球权与区域，不发生推进")
 
+        if self.state.possession != attack:
+            self.state.lane_streak = 0
+        elif target_same_lane:
+            self.state.lane_streak = min(self.state.lane_streak + 1, 15)
+        else:
+            self.state.lane_streak = 0
+        probs["LaneStreakAfter"] = float(self.state.lane_streak)
+        probs["ResampleHit"] = 1.0 if resample_hit else 0.0
+        detail.append(
+            f"【规则】通道状态更新：目标是否同路={'是' if target_same_lane else '否'}，重采样命中={'是' if resample_hit else '否'}，LaneStreak -> {self.state.lane_streak}"
+        )
         detail.append(f"【球权】下一状态：控球方={TEAM_CN.get(self.state.possession, self.state.possession)}，区域={zone_tuple_to_cn(self.state.zone)}")
         logs.extend(detail)
         summary = f"{format_match_time(self.state.match_seconds)} {self.state.last_event} | 比分 A队 {self.state.score_a}:{self.state.score_b} B队"
@@ -774,13 +897,28 @@ class MatchSimulatorEngine:
 
 
 class MatchSimulatorUI:
-    SLOT_MS = 2000
+    AUTO_TOTAL_REAL_SECONDS = 5 * 60
+    HALF_TIME_SECONDS = 45 * 60
+    LOG_FILTER_ITEMS = [
+        ("log_ball", "球权"),
+        ("log_event", "事件"),
+        ("log_result", "结果"),
+        ("log_rand", "随机"),
+        ("log_formula", "公式"),
+        ("log_judge", "判定"),
+        ("log_system", "系统"),
+        ("log_other", "其他"),
+    ]
 
     def __init__(self, root: tk.Tk):
         self.root = root
         self.engine = MatchSimulatorEngine()
+        self.slot_ms = self._compute_auto_slot_ms()
         self.auto_job = None
+        self.halftime_auto_paused = False
         self.last_report: StepReport = None
+        self.log_records: List[Tuple[str, str]] = []
+        self.log_filter_vars: Dict[str, tk.BooleanVar] = {}
         self._syncing_controls = False
         self.form_buttons: Dict[str, List[ttk.Radiobutton]] = {"A": [], "B": []}
         self.strategy_buttons: Dict[str, Dict[str, List[ttk.Radiobutton]]] = {
@@ -789,6 +927,8 @@ class MatchSimulatorUI:
         }
         self.apply_buttons: Dict[str, ttk.Button] = {}
         self.feature_cells: Dict[str, Dict[str, tk.Label]] = {}
+        self.zone_cells: Dict[str, tk.Label] = {}
+        self.zone_cell_base_bg: Dict[str, str] = {}
 
         self.root.title("足球状态机模拟器（阵型/策略可视化）")
         self.root.geometry("1680x980")
@@ -798,6 +938,21 @@ class MatchSimulatorUI:
         self._init_control_vars()
         self._render_full_snapshot()
         self._append_log("系统初始化完成：默认双方 4-4-2 + 默认平衡")
+        self._append_log(
+            f"[系统] 自动推进速度：每{self._fmt_seconds(self.slot_ms / 1000)}秒=赛时{self.engine.STEP_SECONDS}秒，整场约{self.AUTO_TOTAL_REAL_SECONDS / 60:.1f}分钟"
+        )
+
+    @staticmethod
+    def _fmt_seconds(sec: float) -> str:
+        return f"{sec:.2f}".rstrip("0").rstrip(".")
+
+    def _compute_auto_slot_ms(self) -> int:
+        total_steps = max(1, math.ceil(self.engine.MATCH_DURATION_SECONDS / self.engine.STEP_SECONDS))
+        slot = int(round(self.AUTO_TOTAL_REAL_SECONDS * 1000 / total_steps))
+        return max(100, slot)
+
+    def _auto_idle_button_text(self) -> str:
+        return f"开始自动推进(每{self._fmt_seconds(self.slot_ms / 1000)}秒={self.engine.STEP_SECONDS}秒赛时)"
 
     def _build_layout(self) -> None:
         self.root.columnconfigure(0, weight=4)
@@ -806,24 +961,64 @@ class MatchSimulatorUI:
 
         left = ttk.Frame(self.root, padding=8)
         left.grid(row=0, column=0, sticky="nsew")
-        left.rowconfigure(1, weight=1)
+        left.rowconfigure(2, weight=1)
         left.columnconfigure(0, weight=1)
 
-        right = ttk.Frame(self.root, padding=8)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.rowconfigure(4, weight=1)
+        right_outer = ttk.Frame(self.root, padding=8)
+        right_outer.grid(row=0, column=1, sticky="nsew")
+        right_outer.rowconfigure(0, weight=1)
+        right_outer.columnconfigure(0, weight=1)
+
+        self.right_canvas = tk.Canvas(right_outer, highlightthickness=0)
+        self.right_canvas.grid(row=0, column=0, sticky="nsew")
+        right_scroll = ttk.Scrollbar(right_outer, orient="vertical", command=self.right_canvas.yview)
+        right_scroll.grid(row=0, column=1, sticky="ns")
+        self.right_canvas.configure(yscrollcommand=right_scroll.set)
+
+        right = ttk.Frame(self.right_canvas)
+        right_window_id = self.right_canvas.create_window((0, 0), window=right, anchor="nw")
+
+        def _on_right_inner_configure(_: tk.Event) -> None:
+            self.right_canvas.configure(scrollregion=self.right_canvas.bbox("all"))
+
+        def _on_right_canvas_configure(event: tk.Event) -> None:
+            self.right_canvas.itemconfigure(right_window_id, width=event.width)
+
+        def _on_right_mousewheel(event: tk.Event) -> None:
+            if hasattr(event, "delta") and event.delta:
+                step = -1 if event.delta > 0 else 1
+            elif getattr(event, "num", None) == 4:
+                step = -1
+            else:
+                step = 1
+            self.right_canvas.yview_scroll(step, "units")
+
+        right.bind("<Configure>", _on_right_inner_configure)
+        self.right_canvas.bind("<Configure>", _on_right_canvas_configure)
+        self.right_canvas.bind("<MouseWheel>", _on_right_mousewheel)
+        self.right_canvas.bind("<Button-4>", _on_right_mousewheel)
+        self.right_canvas.bind("<Button-5>", _on_right_mousewheel)
+        right.bind("<MouseWheel>", _on_right_mousewheel)
+        right.bind("<Button-4>", _on_right_mousewheel)
+        right.bind("<Button-5>", _on_right_mousewheel)
+
+        right.rowconfigure(5, weight=1)
         right.columnconfigure(0, weight=1)
 
         top_btn = ttk.Frame(left)
         top_btn.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
-        self.btn_start = ttk.Button(top_btn, text="开始自动推进(每2秒=15秒赛时)", command=self.toggle_auto)
+        self.btn_start = ttk.Button(top_btn, text=self._auto_idle_button_text(), command=self.toggle_auto)
         self.btn_start.pack(side="left", padx=(0, 6))
-        ttk.Button(top_btn, text="手动推进15秒赛时", command=self.manual_step).pack(side="left", padx=(0, 6))
+        ttk.Button(top_btn, text=f"手动推进{self.engine.STEP_SECONDS}秒赛时", command=self.manual_step).pack(side="left", padx=(0, 6))
         ttk.Button(top_btn, text="重置比赛", command=self.reset_match).pack(side="left")
 
+        filter_box = ttk.LabelFrame(left, text="日志筛选", padding=6)
+        filter_box.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        self._build_log_filters(filter_box)
+
         self.log_text = tk.Text(left, wrap="word", font=("PingFang SC", 12))
-        self.log_text.grid(row=1, column=0, sticky="nsew")
+        self.log_text.grid(row=2, column=0, sticky="nsew")
         self.log_text.configure(state="disabled")
         self.log_text.tag_configure("log_ball", foreground="#0d47a1", font=("PingFang SC", 12, "bold"))
         self.log_text.tag_configure("log_event", foreground="#6a1b9a", font=("PingFang SC", 12, "bold"))
@@ -833,7 +1028,7 @@ class MatchSimulatorUI:
         self.log_text.tag_configure("log_judge", foreground="#ef6c00", font=("PingFang SC", 12, "bold"))
         self.log_text.tag_configure("log_system", foreground="#37474f")
         log_scroll = ttk.Scrollbar(left, orient="vertical", command=self.log_text.yview)
-        log_scroll.grid(row=1, column=1, sticky="ns")
+        log_scroll.grid(row=2, column=1, sticky="ns")
         self.log_text["yscrollcommand"] = log_scroll.set
 
         info_frame = ttk.LabelFrame(right, text="比赛看板", padding=8)
@@ -849,8 +1044,20 @@ class MatchSimulatorUI:
         self.lbl_status = ttk.Label(info_frame, text="", font=("PingFang SC", 11))
         self.lbl_status.grid(row=2, column=0, sticky="w", pady=(2, 0))
 
+        zone_frame = ttk.LabelFrame(info_frame, text="区域球权图（7x3）", padding=6)
+        zone_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self._build_zone_board(zone_frame)
+        self.lbl_zone_hint = ttk.Label(info_frame, text="", font=("PingFang SC", 10))
+        self.lbl_zone_hint.grid(row=4, column=0, sticky="w", pady=(4, 0))
+
+        stats_frame = ttk.LabelFrame(right, text="专业统计（实时）", padding=8)
+        stats_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        stats_frame.columnconfigure(0, weight=1)
+        self.lbl_stats = ttk.Label(stats_frame, text="", font=("Menlo", 10), justify="left")
+        self.lbl_stats.grid(row=0, column=0, sticky="w")
+
         quota_frame = ttk.LabelFrame(right, text="时间窗调整限制", padding=8)
-        quota_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        quota_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         quota_frame.columnconfigure(0, weight=1)
         self.lbl_quota_a = ttk.Label(quota_frame, text="A队 阵型1 策略2", font=("PingFang SC", 11))
         self.lbl_quota_a.grid(row=0, column=0, sticky="w")
@@ -858,17 +1065,17 @@ class MatchSimulatorUI:
         self.lbl_quota_b.grid(row=1, column=0, sticky="w")
 
         probs_frame = ttk.LabelFrame(right, text="关键概率/事件", padding=8)
-        probs_frame.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        probs_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         probs_frame.columnconfigure(0, weight=1)
         self.lbl_probs = ttk.Label(probs_frame, text="", font=("PingFang SC", 10), justify="left")
         self.lbl_probs.grid(row=0, column=0, sticky="w")
 
         feature_frame = ttk.LabelFrame(right, text="8维评分：基础值 vs 加权值", padding=8)
-        feature_frame.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        feature_frame.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         self._build_feature_table(feature_frame)
 
         controls = ttk.Notebook(right)
-        controls.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
+        controls.grid(row=5, column=0, sticky="nsew", pady=(8, 0))
 
         self.tab_a = self._add_scrollable_tab(controls, "A队战术面板")
         self.tab_b = self._add_scrollable_tab(controls, "B队战术面板")
@@ -927,6 +1134,93 @@ class MatchSimulatorUI:
                 )
                 lbl.grid(row=r, column=c, sticky="nsew")
                 self.feature_cells[key][name] = lbl
+
+    def _build_zone_board(self, parent: ttk.LabelFrame) -> None:
+        board = tk.Frame(parent, bg="#ececec")
+        board.pack(fill="x", expand=False)
+        lanes = [("L", "左路"), ("C", "中路"), ("R", "右路")]
+        # 绝对球场坐标（A队球门 -> B队球门），用于可视化双方换边后的统一位置
+        levels = [
+            ("A_PA", "A禁区"),
+            ("A_BA", "A禁区前沿"),
+            ("A_DZ", "A半场"),
+            ("MC", "中场"),
+            ("B_DZ", "B半场"),
+            ("B_BA", "B禁区前沿"),
+            ("B_PA", "B禁区"),
+        ]
+
+        tk.Label(board, text="", bg="#e0e0e0", fg="#222", width=8, font=("PingFang SC", 10, "bold")).grid(
+            row=0, column=0, sticky="nsew", padx=1, pady=1
+        )
+        for c, (_, lane_cn) in enumerate(lanes, start=1):
+            tk.Label(board, text=lane_cn, bg="#d8d8d8", fg="#222", width=12, font=("PingFang SC", 10, "bold")).grid(
+                row=0, column=c, sticky="nsew", padx=1, pady=1
+            )
+
+        for r, (level, level_cn) in enumerate(levels, start=1):
+            tk.Label(board, text=level_cn, bg="#d8d8d8", fg="#222", width=8, font=("PingFang SC", 10, "bold")).grid(
+                row=r, column=0, sticky="nsew", padx=1, pady=1
+            )
+            for c, (lane, _) in enumerate(lanes, start=1):
+                key = f"{level}_{lane}"
+                base_bg = "#f3f3f3" if (r + c) % 2 else "#ececec"
+                cell = tk.Label(
+                    board,
+                    text="",
+                    bg=base_bg,
+                    fg="#222",
+                    width=12,
+                    height=2,
+                    font=("PingFang SC", 10),
+                    relief="ridge",
+                    borderwidth=1,
+                )
+                cell.grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
+                self.zone_cells[key] = cell
+                self.zone_cell_base_bg[key] = base_bg
+
+        for i in range(4):
+            board.columnconfigure(i, weight=1)
+        for i in range(8):
+            board.rowconfigure(i, weight=1)
+
+    @staticmethod
+    def _to_absolute_zone_key(zone: Tuple[str, str], possession: str) -> Optional[str]:
+        level, lane = zone
+        if lane not in {"L", "C", "R"}:
+            return None
+        if possession == "A":
+            level_map = {"DZ": "A_DZ", "MC": "MC", "AT": "B_DZ", "BA": "B_BA", "PA": "B_PA"}
+        else:
+            level_map = {"DZ": "B_DZ", "MC": "MC", "AT": "A_DZ", "BA": "A_BA", "PA": "A_PA"}
+        abs_level = level_map.get(level)
+        if abs_level is None:
+            return None
+        return f"{abs_level}_{lane}"
+
+    def _render_zone_board(self, zone: Tuple[str, str], possession: str) -> None:
+        for key, cell in self.zone_cells.items():
+            cell.configure(text="", bg=self.zone_cell_base_bg.get(key, "#f3f3f3"), fg="#222")
+
+        active_key = self._to_absolute_zone_key(zone, possession)
+        if active_key is None:
+            self.lbl_zone_hint.configure(text=f"当前球位置：{zone_tuple_to_cn(zone)}  |  控球方：{TEAM_CN.get(possession, possession)}")
+            return
+        active = self.zone_cells.get(active_key)
+        if active is None:
+            return
+
+        if possession == "A":
+            active_bg = "#ffe3e3"
+            active_fg = "#7f1d1d"
+        else:
+            active_bg = "#e3efff"
+            active_fg = "#0f2a6f"
+        active.configure(text=f"球权:{TEAM_CN.get(possession, possession)}", bg=active_bg, fg=active_fg)
+        self.lbl_zone_hint.configure(
+            text=f"当前球位置：{zone_tuple_to_cn(zone)}（映射绝对区域 {active_key.replace('_', '-')})  |  控球方：{TEAM_CN.get(possession, possession)}"
+        )
 
     def _add_scrollable_tab(self, notebook: ttk.Notebook, title: str) -> ttk.Frame:
         outer = ttk.Frame(notebook)
@@ -1039,6 +1333,20 @@ class MatchSimulatorUI:
             btn.grid(row=i // 3, column=i % 3, sticky="w", padx=4)
             self.strategy_buttons[team][key].append(btn)
 
+    def _build_log_filters(self, parent: ttk.LabelFrame) -> None:
+        for col in range(8):
+            parent.columnconfigure(col, weight=1)
+        for i, (tag, text) in enumerate(self.LOG_FILTER_ITEMS):
+            var = tk.BooleanVar(value=True)
+            self.log_filter_vars[tag] = var
+            btn = ttk.Checkbutton(
+                parent,
+                text=text,
+                variable=var,
+                command=self._refresh_log_text,
+            )
+            btn.grid(row=0, column=i, sticky="w", padx=4, pady=2)
+
     def _init_control_vars(self) -> None:
         for team in ["A", "B"]:
             vars_to_bind = [
@@ -1086,6 +1394,34 @@ class MatchSimulatorUI:
             return f"+{delta:.2f}", "#d22f2f"
         return f"{delta:.2f}", "#1f8f55"
 
+    @staticmethod
+    def _format_pct(num: int, den: int) -> str:
+        if den <= 0:
+            return "0.0%"
+        return f"{(100.0 * num / den):.1f}%"
+
+    def _build_stats_text(self, snap: Dict[str, object]) -> str:
+        stats = snap.get("stats", {"A": make_empty_team_stats(), "B": make_empty_team_stats()})
+        a = stats.get("A", make_empty_team_stats())
+        b = stats.get("B", make_empty_team_stats())
+        a_shots = int(a.get("shots", 0))
+        b_shots = int(b.get("shots", 0))
+        a_sot = int(a.get("shots_on_target", 0))
+        b_sot = int(b.get("shots_on_target", 0))
+        a_goals = int(a.get("goals", 0))
+        b_goals = int(b.get("goals", 0))
+        line0 = "指标                  A队        B队"
+        line1 = f"射门次数              {a_shots:<10d}{b_shots}"
+        line2 = f"射正次数              {a_sot:<10d}{b_sot}"
+        line3 = f"射正率                {self._format_pct(a_sot, a_shots):<10}{self._format_pct(b_sot, b_shots)}"
+        line4 = f"射门成功率(进球/射门)  {self._format_pct(a_goals, a_shots):<10}{self._format_pct(b_goals, b_shots)}"
+        line5 = f"失误次数              {int(a.get('turnovers', 0)):<10d}{int(b.get('turnovers', 0))}"
+        line6 = f"防守反击次数          {int(a.get('counterattacks', 0)):<10d}{int(b.get('counterattacks', 0))}"
+        line7 = f"任意球次数            {int(a.get('freekicks', 0)):<10d}{int(b.get('freekicks', 0))}"
+        line8 = f"角球次数              {int(a.get('corners', 0)):<10d}{int(b.get('corners', 0))}"
+        line9 = f"点球次数              {int(a.get('penalties', 0)):<10d}{int(b.get('penalties', 0))}"
+        return "\n".join([line0, line1, line2, line3, line4, line5, line6, line7, line8, line9])
+
     def _sync_controls_with_quota(self, snap: Dict[str, object]) -> None:
         self._syncing_controls = True
         try:
@@ -1122,31 +1458,55 @@ class MatchSimulatorUI:
         finally:
             self._syncing_controls = False
 
-    def _append_log(self, text: str) -> None:
-        self.log_text.configure(state="normal")
-        tag = None
+    @staticmethod
+    def _resolve_log_tag(text: str) -> str:
         stripped = text.strip()
         if stripped.startswith("【球权】"):
-            tag = "log_ball"
-        elif stripped.startswith("【事件】"):
-            tag = "log_event"
-        elif stripped.startswith("【结果】"):
-            tag = "log_result"
-        elif stripped.startswith("【随机】"):
-            tag = "log_rand"
-        elif stripped.startswith("【公式】"):
-            tag = "log_formula"
-        elif stripped.startswith("【判定】"):
-            tag = "log_judge"
-        elif stripped.startswith("[系统]"):
-            tag = "log_system"
+            return "log_ball"
+        if stripped.startswith("【事件】"):
+            return "log_event"
+        if stripped.startswith("【结果】"):
+            return "log_result"
+        if stripped.startswith("【随机】"):
+            return "log_rand"
+        if stripped.startswith("【公式】"):
+            return "log_formula"
+        if stripped.startswith("【判定】"):
+            return "log_judge"
+        if stripped.startswith("[系统]"):
+            return "log_system"
+        return "log_other"
 
-        if tag:
+    def _insert_log_line(self, text: str, tag: str) -> None:
+        self.log_text.configure(state="normal")
+        if tag in {"log_ball", "log_event", "log_result", "log_rand", "log_formula", "log_judge", "log_system"}:
             self.log_text.insert("end", text + "\n", (tag,))
         else:
             self.log_text.insert("end", text + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    def _is_log_tag_enabled(self, tag: str) -> bool:
+        var = self.log_filter_vars.get(tag)
+        return True if var is None else bool(var.get())
+
+    def _refresh_log_text(self) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        for text, tag in self.log_records:
+            if self._is_log_tag_enabled(tag):
+                if tag in {"log_ball", "log_event", "log_result", "log_rand", "log_formula", "log_judge", "log_system"}:
+                    self.log_text.insert("end", text + "\n", (tag,))
+                else:
+                    self.log_text.insert("end", text + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+
+    def _append_log(self, text: str) -> None:
+        tag = self._resolve_log_tag(text)
+        self.log_records.append((text, tag))
+        if self._is_log_tag_enabled(tag):
+            self._insert_log_line(text, tag)
 
     def apply_adjustments(self, team: str) -> None:
         ok, msgs = self.engine.apply_team_adjustment(
@@ -1173,38 +1533,52 @@ class MatchSimulatorUI:
     def toggle_auto(self) -> None:
         if self.auto_job is None:
             self.btn_start.configure(text="暂停自动推进")
-            self._append_log("[系统] 自动推进已启动：每2秒推进15秒比赛时间")
+            self._append_log(
+                f"[系统] 自动推进已启动：每{self._fmt_seconds(self.slot_ms / 1000)}秒推进{self.engine.STEP_SECONDS}秒比赛时间（整场约{self.AUTO_TOTAL_REAL_SECONDS / 60:.1f}分钟）"
+            )
             self._auto_tick()
         else:
             self.root.after_cancel(self.auto_job)
             self.auto_job = None
-            self.btn_start.configure(text="开始自动推进(每2秒=15秒赛时)")
+            self.btn_start.configure(text=self._auto_idle_button_text())
             self._append_log("[系统] 自动推进已暂停")
 
     def _auto_tick(self) -> None:
+        before_seconds = self.engine.state.match_seconds
         self.manual_step()
+        after_seconds = self.engine.state.match_seconds
+        if (
+            not self.halftime_auto_paused
+            and before_seconds < self.HALF_TIME_SECONDS <= after_seconds
+            and after_seconds < self.engine.MATCH_DURATION_SECONDS
+        ):
+            self.halftime_auto_paused = True
+            self.auto_job = None
+            self.btn_start.configure(text="继续下半场自动推进")
+            self._append_log("[系统] 已到中场(45:00)，自动推进已暂停，请手动确认后开始下半场")
+            return
         if self.engine.state.match_seconds >= self.engine.MATCH_DURATION_SECONDS:
             self.auto_job = None
-            self.btn_start.configure(text="开始自动推进(每2秒=15秒赛时)")
+            self.btn_start.configure(text=self._auto_idle_button_text())
             self._append_log("[系统] 比赛已结束，自动推进停止")
             return
-        self.auto_job = self.root.after(self.SLOT_MS, self._auto_tick)
+        self.auto_job = self.root.after(self.slot_ms, self._auto_tick)
 
     def reset_match(self) -> None:
         if self.auto_job is not None:
             self.root.after_cancel(self.auto_job)
             self.auto_job = None
-            self.btn_start.configure(text="开始自动推进(每2秒=15秒赛时)")
+            self.btn_start.configure(text=self._auto_idle_button_text())
         self.engine.reset()
+        self.halftime_auto_paused = False
         for team in ["A", "B"]:
             getattr(self, f"var_form_{team}").set("4-4-2")
             getattr(self, f"var_{team}_height").set("默认平衡")
             getattr(self, f"var_{team}_tempo").set("默认平衡")
             getattr(self, f"var_{team}_channel").set("默认平衡")
 
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
+        self.log_records.clear()
+        self._refresh_log_text()
 
         self.last_report = None
         self._append_log("[系统] 已重置：双方恢复 4-4-2 + 默认平衡")
@@ -1236,6 +1610,8 @@ class MatchSimulatorUI:
                 f"B阵型:{preview_b['formation']} 策略:{b_tactics_text}"
             )
         )
+        self._render_zone_board(zone, snap["possession"])
+        self.lbl_stats.configure(text=self._build_stats_text(snap))
 
         quota_a = snap["A"]["quota"]
         quota_b = snap["B"]["quota"]
@@ -1258,7 +1634,7 @@ class MatchSimulatorUI:
         getattr(self, "lbl_route_B").configure(text=f"左/中/右 = {br[0]:.2f} / {br[1]:.2f} / {br[2]:.2f}")
 
         if report is None:
-            self.lbl_probs.configure(text="暂无推进数据，点击“手动推进15秒赛时”或启动自动推进")
+            self.lbl_probs.configure(text=f"暂无推进数据，点击“手动推进{self.engine.STEP_SECONDS}秒赛时”或启动自动推进")
             return
 
         probs = report.probs

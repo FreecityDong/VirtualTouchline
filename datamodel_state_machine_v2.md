@@ -54,7 +54,11 @@
 | `W_form` | 阵型左中右路线倾向权重 |
 | `W_form_base` | 阵型先验路线倾向权重 |
 | `W_form_dyn` | 当前时间片动态路线倾向权重 |
+| `W_route_eff` | 叠加通道疲劳后的有效路线权重 |
 | `DeltaW_route` | 策略对路线倾向的修正向量 |
+| `LaneStreak` | 连续命中同一通道的计数器 |
+| `k_lane_fatigue` | 通道疲劳系数（同路降权强度） |
+| `W_excl` | 排除当前通道后的重采样权重 |
 | `W_attack` | 区域进攻能力映射权重 |
 | `W_defense` | 区域防守能力映射权重 |
 | `C_attack(zone)` | 在某区域的进攻能力评分 |
@@ -310,6 +314,30 @@
 - `W_form_dyn`用于同层横向转移、门将开球落点分配、反击起始通道选择。
 - 若无相关策略生效，则`W_form_dyn = W_form_base`。
 
+### 3.3.2 通道疲劳与同路重采样
+
+为避免“连续选择同一路导致表面转移但实际停留”，在`W_form_dyn`上再叠加通道疲劳，得到本时间片的有效路线权重：
+
+- `W_route_eff = normalize(W_form_dyn * FatigueMask)`
+- `FatigueMask[current_lane] = exp(-k_lane_fatigue * LaneStreak)`
+- `FatigueMask[other_lanes] = 1.0`
+
+建议参数：
+
+- `k_lane_fatigue = 0.6`（可在`0.4~0.8`调参）
+- `LaneStreak`在“目标通道=当前通道”时递增，否则归零
+- 当时间片结束后球权发生变化时，`LaneStreak`强制归零（避免把上一支球队的通道惯性传递给对手）
+
+同路重采样规则（用于横向转移）：
+
+- 若`target_lane == current_lane`，则不直接执行横向转移；
+- 改为在其余两个通道按`W_excl`重采样：
+- `W_excl[l] = W_route_eff[l] / (1 - W_route_eff[current_lane]) , l != current_lane`
+- `W_excl[current_lane] = 0`
+- 当分母接近0时，退化为在另两路均匀采样。
+
+该规则只改变“横向转移的落点通道”，不改变`P_switch`本身。
+
 ### 3.4 区域映射权重（9区）
 
 计算区域攻防能力：
@@ -380,8 +408,30 @@
 
 其中：
 
-- `RouteBias = k_route * (W_form_dyn[target_lane] - 1/3)`，`k_route`建议取`0.15~0.25`
+- `RouteBias = k_route * (W_route_eff[target_lane] - 1/3)`，`k_route`建议取`0.15~0.25`
 - 当目标通道是当前策略偏好的通道时，`RouteBias > 0`，横向切换更容易成功
+
+目标通道采样建议（与实现一致）：
+
+- 先由`W_route_eff`采样得到`target_lane`
+- 若命中“横向转移”且`target_lane == current_lane`，执行“同路重采样”
+- 重采样后的通道作为`P_switch`的最终落点
+- 若`zone.level = PA`，建议增加推进门控：`AdvanceGate=0`，即禁止继续纵向推进
+
+终结区（`BA/PA`）概率偏置建议：
+
+- `P_switch' = P_switch * SwitchEndzoneFactor(level)`  
+  建议：`DZ=1.00, MC=1.00, AT=0.92, BA=0.68, PA=0.50`
+- `P_hold`向射门事件回灌：  
+  `delta_shot = P_hold * HoldToShotRatio(level)`  
+  `P_shot' = clamp(P_shot + delta_shot, 0, P_shot_cap)`  
+  `P_hold' = P_hold - (P_shot' - P_shot)`  
+  建议：`DZ=0.00, MC=0.00, AT=0.05, BA=0.28, PA=0.42`
+
+解释：
+
+- 进入禁区前沿/禁区后，减少无效横传和原地停留；
+- 把一部分停留概率转化为射门触发概率，符合真实比赛“终结优先”的行为。
 
 其中：
 - `P_advance`：纵向推进到下一层区域的概率
@@ -425,14 +475,36 @@
 
 - `ShotRate = BaseShots * (0.4*F_build + 0.4*F_progress + 0.2*F_transition) * (1 - F_disrupt)`
 - `ShotProb = 1 - exp(-ShotRate * DeltaT)`
+- `P_shot = clamp(ShotProb * ZoneMul(level) * ZoneShotGate(level) * LaneShotGate(lane), 0, 1)`
 - `ShotQuality = BaseXG * (0.6*F_entry + 0.4*F_progress)`
 - `Lambda = ShotRate * ShotQuality * M(A->B)`
 
 其中：
 - `ShotRate`：当前时间片射门发生强度
 - `ShotProb`：当前时间片至少一次射门概率
+- `P_shot`：当前时间片触发“射门事件”的概率（已含区域与通道门控）
 - `ShotQuality`：射门质量（近似xG质量项）
 - `Lambda`：当前时间片进球率参数
+
+区域/通道门控建议值（当前实现）：
+
+| 项 | DZ | MC | AT | BA | PA |
+| --- | --- | --- | --- | --- | --- |
+| `ZoneMul(level)` | 0.45 | 0.65 | 1.00 | 1.25 | 1.45 |
+| `ZoneShotGate(level)` | 0.06 | 0.14 | 0.38 | 0.72 | 1.00 |
+| `ShotEndzoneBoost(level)` | 1.00 | 1.00 | 1.00 | 1.18 | 1.30 |
+
+`LaneShotGate(lane)`：
+
+- 左路 `L` = `0.88`
+- 中路 `C` = `1.00`
+- 右路 `R` = `0.88`
+
+解释：
+
+- `ZoneMul`体现“越靠近球门，射门倾向越强”。
+- `ZoneShotGate`用于压制中后场超远距离射门频率。
+- `LaneShotGate`让中路射门略高于边路，符合常见射门角度规律。
 
 ### 5.2 射门结果分解
 
@@ -583,11 +655,13 @@
 
 1. 读取当前状态`S_k`
 2. 计算策略修正`F', Risk'`
-3. 计算对抗系数`M`和过程因子
-4. 分配`P_event`并优先处理事件回流
-5. 若无事件，执行`P_flow`（推进/转移/失误）
-6. 若触发射门，进入射门类型与结果分解
-7. 更新`S_(k+1)`并记录事件
+3. 计算`W_form_dyn`并叠加通道疲劳得到`W_route_eff`
+4. 计算对抗系数`M`和过程因子
+5. 分配`P_event`并优先处理事件回流
+6. 若无事件，执行`P_flow`（推进/转移/失误）
+7. 若命中横向转移且目标通道=当前通道，执行同路重采样
+8. 若触发射门，进入射门类型与结果分解
+9. 更新`S_(k+1)`、`LaneStreak`并记录事件
 
 ---
 
@@ -615,4 +689,5 @@
 - 时间片建议先用`1分钟`，后续再做`5分钟`压缩对比。
 - 所有概率统一`clamp`并做归一化，避免越界。
 - 日志结构固定为：`time, possession, zone, event, shot_type, result, xg, score`。
+- 建议新增日志字段：`route_raw, route_eff, lane_streak, resample_hit`，用于校验“疲劳与重采样”是否生效。
 - 先实现核心射门类型，再按需求扩展类型库。
