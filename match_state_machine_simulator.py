@@ -1,9 +1,17 @@
+import json
 import math
+import os
 import random
+import threading
 import tkinter as tk
 from dataclasses import dataclass, field
 from tkinter import ttk
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
 
 FEATURE_KEYS = ["AW", "DW", "CN", "HS", "PR", "BS", "TR", "BU"]
@@ -325,18 +333,530 @@ class MatchSimulatorEngine:
         self.team_a = TeamTactics()
         self.team_b = TeamTactics()
         self.quota = {"A": TeamWindowQuota(), "B": TeamWindowQuota()}
+        self._init_analysis_buffers()
+        self._record_a_feature_snapshot(reason="init")
 
     def reset(self) -> None:
         self.state = MatchState()
         self.team_a = TeamTactics()
         self.team_b = TeamTactics()
         self.quota = {"A": TeamWindowQuota(), "B": TeamWindowQuota()}
+        self._init_analysis_buffers()
+        self._record_a_feature_snapshot(reason="reset")
+
+    def _init_analysis_buffers(self) -> None:
+        self.event_history: List[Dict[str, Any]] = []
+        self.a_tactics_history: List[Dict[str, Any]] = []
+        self.a_feature_history: List[Dict[str, Any]] = []
 
     def team_obj(self, team: str) -> TeamTactics:
         return self.team_a if team == "A" else self.team_b
 
     def opp_team(self, team: str) -> str:
         return "B" if team == "A" else "A"
+
+    @staticmethod
+    def _phase_label(seconds: int) -> str:
+        start = (seconds // 900) * 15
+        end = min(start + 15, 90)
+        return f"{start}-{end}"
+
+    def _team_tactics_payload(self, team: str) -> Dict[str, Any]:
+        obj = self.team_obj(team)
+        return {
+            "formation": obj.formation,
+            "strategy_height": obj.strategy_height,
+            "strategy_tempo": obj.strategy_tempo,
+            "strategy_channel": obj.strategy_channel,
+            "strategy_names": obj.strategy_names(),
+        }
+
+    def _record_a_feature_snapshot(self, reason: str) -> None:
+        base, weighted, delta, risk, route = self.calc_features_for_config(
+            self.team_a.formation,
+            self.team_a.strategy_height,
+            self.team_a.strategy_tempo,
+            self.team_a.strategy_channel,
+        )
+        self.a_feature_history.append(
+            {
+                "time": format_match_time(self.state.match_seconds),
+                "match_seconds": self.state.match_seconds,
+                "reason": reason,
+                "formation": self.team_a.formation,
+                "strategies": self.team_a.strategy_names(),
+                "base": {k: round(v, 4) for k, v in base.items()},
+                "weighted": {k: round(v, 4) for k, v in weighted.items()},
+                "delta": {k: round(v, 4) for k, v in delta.items()},
+                "risk": round(risk, 4),
+                "route": {"L": round(route[0], 4), "C": round(route[1], 4), "R": round(route[2], 4)},
+            }
+        )
+
+    @staticmethod
+    def _classify_event(event_text: str) -> str:
+        if "点球" in event_text:
+            return "penalty"
+        if "任意球" in event_text:
+            return "freekick"
+        if "角球" in event_text:
+            return "corner"
+        if "射门" in event_text:
+            return "shot"
+        if "失误被断" in event_text:
+            return "turnover"
+        if "出界" in event_text:
+            return "out"
+        if "推进成功" in event_text:
+            return "advance"
+        if "横向转移" in event_text:
+            return "switch"
+        if "停留" in event_text:
+            return "hold"
+        return "other"
+
+    @staticmethod
+    def _event_importance_for_a(ev: Dict[str, Any]) -> float:
+        score = 0.0
+        et = ev.get("event_type", "other")
+        delta = ev.get("score_delta", {"A": 0, "B": 0})
+        if delta.get("A", 0) > 0:
+            score += 10.0
+        if delta.get("B", 0) > 0:
+            score += 8.0
+        if et == "penalty":
+            score += 6.0
+        elif et == "shot":
+            score += 4.0
+        elif et == "freekick":
+            score += 3.5
+        elif et == "corner":
+            score += 2.5
+        elif et == "turnover":
+            score += 3.0
+        elif et in {"advance", "switch"}:
+            score += 1.0
+
+        if ev.get("attack_team") == "A":
+            score += 1.0
+        if ev.get("defend_team") == "A" and et in {"turnover", "shot", "penalty", "freekick"}:
+            score += 1.5
+        if ev.get("zone_before", "").startswith(("BA", "PA")) or ev.get("zone_after", "").startswith(("BA", "PA")):
+            score += 0.8
+        return score
+
+    def _select_a_key_events(
+        self,
+        until_seconds: int,
+        max_events: int = 30,
+        include_probs: bool = False,
+    ) -> List[Dict[str, Any]]:
+        pool = [ev for ev in self.event_history if ev.get("match_seconds", 0) <= until_seconds]
+        scored = sorted(
+            pool,
+            key=lambda ev: (self._event_importance_for_a(ev), ev.get("match_seconds", 0)),
+            reverse=True,
+        )
+        top = sorted(scored[:max_events], key=lambda ev: ev.get("match_seconds", 0))
+        out = []
+        for ev in top:
+            item: Dict[str, Any] = {
+                "evidence_id": ev["id"],
+                "time": ev["time"],
+                "phase": ev["phase"],
+                "event": ev["event"],
+                "event_type": ev["event_type"],
+                "attack_team": ev["attack_team"],
+                "zone_before": ev["zone_before_cn"],
+                "zone_after": ev["zone_after_cn"],
+                "score_after": ev["score_after"],
+                "stats_delta_A": ev["stats_delta_A"],
+            }
+            if include_probs:
+                item["probs"] = ev["probs"]
+            out.append(item)
+        return out
+
+    def _build_timeline_events(
+        self,
+        until_seconds: int,
+        timeline_scope: str = "all",
+        include_probs: bool = False,
+        include_shot_info: bool = False,
+    ) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = []
+        for ev in self.event_history:
+            sec = ev.get("match_seconds", 0)
+            if sec > until_seconds:
+                continue
+            if timeline_scope == "A_possession" and ev.get("attack_team") != "A":
+                continue
+
+            item: Dict[str, Any] = {
+                "id": ev.get("id"),
+                "time": ev.get("time"),
+                "phase": ev.get("phase"),
+                "event": ev.get("event"),
+                "event_type": ev.get("event_type"),
+                "attack_team": ev.get("attack_team"),
+                "defend_team": ev.get("defend_team"),
+                "possession_before": ev.get("possession_before"),
+                "possession_after": ev.get("possession_after"),
+                "zone_before": ev.get("zone_before"),
+                "zone_before_cn": ev.get("zone_before_cn"),
+                "zone_after": ev.get("zone_after"),
+                "zone_after_cn": ev.get("zone_after_cn"),
+                "score_before": ev.get("score_before"),
+                "score_after": ev.get("score_after"),
+                "score_delta": ev.get("score_delta"),
+                "stats_delta_A": ev.get("stats_delta_A"),
+                "stats_delta_B": ev.get("stats_delta_B"),
+                "summary": ev.get("summary"),
+            }
+            if include_probs:
+                item["probs"] = ev.get("probs", {})
+            if include_shot_info:
+                item["shot_info"] = ev.get("shot_info", {})
+            events.append(item)
+        return events
+
+    @staticmethod
+    def _timeline_digest_line(ev: Dict[str, Any]) -> str:
+        atk = ev.get("attack_team", "?")
+        z0 = ev.get("zone_before_cn", ev.get("zone_before", ""))
+        z1 = ev.get("zone_after_cn", ev.get("zone_after", ""))
+        sc = ev.get("score_after", {"A": 0, "B": 0})
+        return (
+            f"{ev.get('time', '00:00')} [{atk}] {z0}->{z1} | "
+            f"{ev.get('event', '')} | 比分 {sc.get('A', 0)}:{sc.get('B', 0)}"
+        )
+
+    def _build_timeline_digest(
+        self,
+        until_seconds: int,
+        timeline_scope: str = "all",
+        max_lines: int = 80,
+        anchor_every_n_events: int = 8,
+    ) -> List[str]:
+        pool = [ev for ev in self.event_history if ev.get("match_seconds", 0) <= until_seconds]
+        if timeline_scope == "A_possession":
+            pool = [ev for ev in pool if ev.get("attack_team") == "A"]
+        if not pool:
+            return []
+
+        must_ids: List[str] = []
+        major_ids: List[str] = []
+        anchor_ids: List[str] = []
+        for idx, ev in enumerate(pool):
+            eid = ev.get("id")
+            if not eid:
+                continue
+            delta = ev.get("score_delta", {"A": 0, "B": 0})
+            if int(delta.get("A", 0)) != 0 or int(delta.get("B", 0)) != 0:
+                must_ids.append(eid)
+                continue
+            et = ev.get("event_type", "other")
+            if et in {"shot", "penalty", "freekick", "turnover", "corner"}:
+                major_ids.append(eid)
+                continue
+            if idx % max(1, anchor_every_n_events) == 0:
+                anchor_ids.append(eid)
+
+        by_id = {ev.get("id"): ev for ev in pool if ev.get("id")}
+        selected: List[Dict[str, Any]] = []
+        selected_ids = set()
+
+        for eid in must_ids:
+            if eid in by_id and eid not in selected_ids:
+                selected.append(by_id[eid])
+                selected_ids.add(eid)
+
+        remaining = max(0, max_lines - len(selected))
+        if remaining > 0:
+            scored_major = [
+                (self._event_importance_for_a(by_id[eid]), by_id[eid].get("match_seconds", 0), by_id[eid])
+                for eid in major_ids
+                if eid in by_id and eid not in selected_ids
+            ]
+            scored_major.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            for _, _, ev in scored_major[:remaining]:
+                eid = ev.get("id")
+                if eid and eid not in selected_ids:
+                    selected.append(ev)
+                    selected_ids.add(eid)
+
+        remaining = max(0, max_lines - len(selected))
+        if remaining > 0:
+            for eid in anchor_ids:
+                if eid in by_id and eid not in selected_ids:
+                    selected.append(by_id[eid])
+                    selected_ids.add(eid)
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
+
+        selected.sort(key=lambda ev: ev.get("match_seconds", 0))
+        return [self._timeline_digest_line(ev) for ev in selected]
+
+    def _build_a_phase_kpi(self, until_seconds: int) -> List[Dict[str, Any]]:
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for ev in self.event_history:
+            sec = ev.get("match_seconds", 0)
+            if sec > until_seconds:
+                continue
+            phase = ev.get("phase", self._phase_label(sec))
+            if phase not in buckets:
+                buckets[phase] = {
+                    "phase": phase,
+                    "events": 0,
+                    "a_possessions": 0,
+                    "a_shots": 0,
+                    "a_shots_on_target": 0,
+                    "a_goals": 0,
+                    "a_turnovers": 0,
+                    "a_counterattacks": 0,
+                    "a_freekicks": 0,
+                    "a_penalties": 0,
+                    "a_corners": 0,
+                }
+            b = buckets[phase]
+            b["events"] += 1
+            if ev.get("attack_team") == "A":
+                b["a_possessions"] += 1
+            d = ev.get("stats_delta_A", {})
+            for k in ["shots", "shots_on_target", "goals", "turnovers", "counterattacks", "freekicks", "penalties", "corners"]:
+                b[f"a_{k}"] += int(d.get(k, 0))
+        return [buckets[k] for k in sorted(buckets.keys(), key=lambda p: int(p.split("-")[0]))]
+
+    def _record_step_event(
+        self,
+        attack: str,
+        defend: str,
+        zone_before: Tuple[str, str],
+        score_before: Tuple[int, int],
+        stats_before: Dict[str, Dict[str, int]],
+        probs: Dict[str, float],
+        shot_info: Dict[str, float],
+        summary: str,
+    ) -> None:
+        score_after = (self.state.score_a, self.state.score_b)
+        delta_score = {"A": score_after[0] - score_before[0], "B": score_after[1] - score_before[1]}
+        stats_delta_a = {
+            k: int(self.state.team_stats["A"][k] - stats_before["A"].get(k, 0))
+            for k in TEAM_STATS_KEYS
+        }
+        stats_delta_b = {
+            k: int(self.state.team_stats["B"][k] - stats_before["B"].get(k, 0))
+            for k in TEAM_STATS_KEYS
+        }
+        eid = f"e{len(self.event_history) + 1}"
+        self.event_history.append(
+            {
+                "id": eid,
+                "match_seconds": self.state.match_seconds,
+                "time": format_match_time(self.state.match_seconds),
+                "phase": self._phase_label(self.state.match_seconds),
+                "event": self.state.last_event,
+                "event_type": self._classify_event(self.state.last_event),
+                "attack_team": attack,
+                "defend_team": defend,
+                "possession_before": attack,
+                "possession_after": self.state.possession,
+                "zone_before": zone_tuple_to_str(zone_before),
+                "zone_before_cn": zone_tuple_to_cn(zone_before),
+                "zone_after": zone_tuple_to_str(self.state.zone),
+                "zone_after_cn": zone_tuple_to_cn(self.state.zone),
+                "score_before": {"A": score_before[0], "B": score_before[1]},
+                "score_after": {"A": score_after[0], "B": score_after[1]},
+                "score_delta": delta_score,
+                "stats_delta_A": stats_delta_a,
+                "stats_delta_B": stats_delta_b,
+                "probs": {k: round(float(v), 4) for k, v in probs.items()},
+                "shot_info": {k: round(float(v), 4) if isinstance(v, (int, float)) else v for k, v in shot_info.items()},
+                "summary": summary,
+                "a_tactics": self._team_tactics_payload("A"),
+                "b_tactics": self._team_tactics_payload("B"),
+            }
+        )
+
+    def build_a_analysis_context(
+        self,
+        report_type: str = "halftime",
+        max_key_events: int = 30,
+        include_b_light: bool = True,
+        include_full_timeline: bool = False,
+        timeline_scope: str = "all",
+        timeline_compact: bool = True,
+        include_key_event_probs: bool = False,
+        compact_for_llm: bool = False,
+        max_timeline_lines: int = 80,
+    ) -> Dict[str, Any]:
+        if report_type not in {"halftime", "fulltime", "realtime"}:
+            report_type = "realtime"
+        if report_type == "halftime":
+            until_seconds = min(self.state.match_seconds, 45 * 60)
+        elif report_type == "fulltime":
+            until_seconds = min(self.state.match_seconds, 90 * 60)
+        else:
+            until_seconds = self.state.match_seconds
+
+        snap = self.get_snapshot()
+        score = snap["score"]
+        a_tactics_history = [x for x in self.a_tactics_history if x["match_seconds"] <= until_seconds]
+        a_feature_history = [x for x in self.a_feature_history if x["match_seconds"] <= until_seconds]
+        key_events = self._select_a_key_events(
+            until_seconds,
+            max_events=max_key_events,
+            include_probs=include_key_event_probs,
+        )
+        phase_kpi = self._build_a_phase_kpi(until_seconds)
+
+        context: Dict[str, Any] = {
+            "analysis_scope": "A_only",
+            "report_type": report_type,
+            "match_meta": {
+                "match_seconds": until_seconds,
+                "time": format_match_time(until_seconds),
+                "window_index": self.state.current_window,
+                "step_seconds": self.STEP_SECONDS,
+                "lane_fatigue_k": self.LANE_FATIGUE_K,
+            },
+            "score_state": {
+                "A": score[0],
+                "B": score[1],
+                "possession": snap["possession"],
+                "zone": zone_tuple_to_str(snap["zone"]),
+                "zone_cn": zone_tuple_to_cn(snap["zone"]),
+                "last_event": snap["last_event"],
+            },
+            "a_current_tactics": self._team_tactics_payload("A"),
+            "a_current_features": {
+                "base": {k: round(v, 4) for k, v in snap["A"]["base"].items()},
+                "weighted": {k: round(v, 4) for k, v in snap["A"]["weighted"].items()},
+                "risk": round(float(snap["A"]["risk"]), 4),
+                "route": {
+                    "L": round(float(snap["A"]["route"][0]), 4),
+                    "C": round(float(snap["A"]["route"][1]), 4),
+                    "R": round(float(snap["A"]["route"][2]), 4),
+                },
+            },
+            "a_tactics_history": a_tactics_history,
+            "a_feature_history": a_feature_history,
+            "a_phase_kpi": phase_kpi,
+            "a_key_events": key_events,
+            "timeline_meta": {
+                "available_total": sum(1 for ev in self.event_history if ev.get("match_seconds", 0) <= until_seconds),
+                "included": include_full_timeline,
+                "scope": timeline_scope,
+                "compact": timeline_compact,
+                "compact_for_llm": compact_for_llm,
+            },
+        }
+        if include_full_timeline:
+            if compact_for_llm:
+                context["timeline_digest"] = self._build_timeline_digest(
+                    until_seconds=until_seconds,
+                    timeline_scope=timeline_scope,
+                    max_lines=max_timeline_lines,
+                )
+            else:
+                context["timeline_events"] = self._build_timeline_events(
+                    until_seconds=until_seconds,
+                    timeline_scope=timeline_scope,
+                    include_probs=not timeline_compact,
+                    include_shot_info=not timeline_compact,
+                )
+        if include_b_light:
+            context["b_light_context"] = {
+                "current_tactics": self._team_tactics_payload("B"),
+                "weighted_features": {k: round(v, 4) for k, v in snap["B"]["weighted"].items()},
+                "risk": round(float(snap["B"]["risk"]), 4),
+            }
+        return context
+
+    def build_deepseek_prompt_payload(
+        self,
+        report_type: str = "halftime",
+        include_full_timeline: bool = True,
+        timeline_scope: str = "all",
+        timeline_compact: bool = True,
+        max_key_events: int = 30,
+        include_probability_fields: bool = False,
+        compact_for_llm: bool = True,
+        max_timeline_lines: int = 80,
+    ) -> Dict[str, Any]:
+        context = self.build_a_analysis_context(
+            report_type=report_type,
+            max_key_events=max_key_events,
+            include_b_light=True,
+            include_full_timeline=include_full_timeline,
+            timeline_scope=timeline_scope,
+            timeline_compact=(timeline_compact and not include_probability_fields),
+            include_key_event_probs=include_probability_fields,
+            compact_for_llm=compact_for_llm,
+            max_timeline_lines=max_timeline_lines,
+        )
+        system_prompt = (
+            "你是职业足球战术分析师。仅分析A队，不对B队提出建议。"
+            "必须严格依据输入数据，不得编造。输出中文，结构化、可执行。"
+        )
+        if report_type == "halftime":
+            user_prompt = {
+                "task": "中场战术分析（45:00）",
+                "requirements": [
+                    "先给3条结论，再给证据",
+                    "复盘关键事件（按时间顺序）",
+                    "解释阵型/策略与8维加权评分对结果的影响",
+                    "给下半场3条可执行建议（每条含触发条件）",
+                ],
+                "output_json_schema": {
+                    "summary": "string",
+                    "key_findings": ["string"],
+                    "evidence_timeline": [{"time": "mm:ss", "event": "string", "impact": "string"}],
+                    "tactical_diagnosis": {
+                        "strengths": ["string"],
+                        "weaknesses": ["string"],
+                        "risk_points": ["string"],
+                    },
+                    "second_half_plan": [
+                        {"advice": "string", "trigger": "string", "expected_effect": "string"}
+                    ],
+                },
+                "context": context,
+            }
+        else:
+            user_prompt = {
+                "task": "终场战术复盘（90:00）",
+                "requirements": [
+                    "评价A队全场战术执行质量与稳定性",
+                    "指出3-5个转折点并说明因果链",
+                    "评估阵型/策略调整是否有效",
+                    "给下一场的训练与比赛建议（至少4条）",
+                ],
+                "output_json_schema": {
+                    "match_assessment": "string",
+                    "turning_points": [{"time": "mm:ss", "cause": "string", "effect": "string"}],
+                    "strategy_review": {
+                        "effective": ["string"],
+                        "ineffective": ["string"],
+                        "why": ["string"],
+                    },
+                    "metric_interpretation": {
+                        "shot_quality": "string",
+                        "transition_control": "string",
+                        "error_management": "string",
+                    },
+                    "next_match_actions": [
+                        {"action": "string", "priority": "high|medium|low", "metric_target": "string"}
+                    ],
+                    "coach_brief": "string",
+                },
+                "context": context,
+            }
+        return {
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+        }
 
     def calc_features_for_config(
         self,
@@ -413,6 +933,12 @@ class MatchSimulatorEngine:
         quota = self.quota[team]
         msgs: List[str] = []
         any_applied = False
+        old_state = {
+            "formation": obj.formation,
+            "strategy_height": obj.strategy_height,
+            "strategy_tempo": obj.strategy_tempo,
+            "strategy_channel": obj.strategy_channel,
+        }
 
         formation_changed = selected_formation != obj.formation
         strategy_changed = (
@@ -445,6 +971,23 @@ class MatchSimulatorEngine:
         if not formation_changed and not strategy_changed:
             msgs.append(f"{team}队未检测到变更")
             return False, msgs
+        if any_applied and team == "A":
+            self.a_tactics_history.append(
+                {
+                    "time": format_match_time(self.state.match_seconds),
+                    "match_seconds": self.state.match_seconds,
+                    "old": old_state,
+                    "new": {
+                        "formation": obj.formation,
+                        "strategy_height": obj.strategy_height,
+                        "strategy_tempo": obj.strategy_tempo,
+                        "strategy_channel": obj.strategy_channel,
+                    },
+                    "window_index": self.state.current_window,
+                    "message": " | ".join(msgs),
+                }
+            )
+            self._record_a_feature_snapshot(reason="a_adjustment")
         return any_applied, msgs
 
     def _build_process_factors(self, team: str, opp: str, zone_level: str) -> Dict[str, float]:
@@ -645,12 +1188,18 @@ class MatchSimulatorEngine:
         if self.state.match_seconds >= self.MATCH_DURATION_SECONDS:
             return StepReport("比赛已结束", ["比赛结束，停止推进"], {}, {})
 
+        score_before = (self.state.score_a, self.state.score_b)
+        stats_before = {
+            "A": dict(self.state.team_stats["A"]),
+            "B": dict(self.state.team_stats["B"]),
+        }
         self.state.match_seconds += self.STEP_SECONDS
         logs = self._roll_window()
 
         attack = self.state.possession
         defend = self.opp_team(attack)
         zone = self.state.zone
+        zone_before = zone
         route_raw = self._calc_weighted_features(attack)[3]
         route_eff, fatigue_factor = apply_lane_fatigue(
             route_raw,
@@ -892,6 +1441,16 @@ class MatchSimulatorEngine:
         detail.append(f"【球权】下一状态：控球方={TEAM_CN.get(self.state.possession, self.state.possession)}，区域={zone_tuple_to_cn(self.state.zone)}")
         logs.extend(detail)
         summary = f"{format_match_time(self.state.match_seconds)} {self.state.last_event} | 比分 A队 {self.state.score_a}:{self.state.score_b} B队"
+        self._record_step_event(
+            attack=attack,
+            defend=defend,
+            zone_before=zone_before,
+            score_before=score_before,
+            stats_before=stats_before,
+            probs=probs,
+            shot_info=shot_info,
+            summary=summary,
+        )
 
         return StepReport(summary=summary, detail_lines=logs, probs=probs, shot_info=shot_info)
 
@@ -899,6 +1458,10 @@ class MatchSimulatorEngine:
 class MatchSimulatorUI:
     AUTO_TOTAL_REAL_SECONDS = 5 * 60
     HALF_TIME_SECONDS = 45 * 60
+    ANALYSIS_POPUP_SHOW_MS = 15_000
+    LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    LLM_MODEL = "deepseek-v3.2"
+    LLM_DEFAULT_API_KEY = "sk-bac18f9772b14f35ad33a8e53e5d9809"
     LOG_FILTER_ITEMS = [
         ("log_ball", "球权"),
         ("log_event", "事件"),
@@ -929,6 +1492,11 @@ class MatchSimulatorUI:
         self.feature_cells: Dict[str, Dict[str, tk.Label]] = {}
         self.zone_cells: Dict[str, tk.Label] = {}
         self.zone_cell_base_bg: Dict[str, str] = {}
+        self.halftime_analysis_done = False
+        self.fulltime_analysis_done = False
+        self.analysis_popup: Optional[tk.Toplevel] = None
+        self.analysis_text: Optional[tk.Text] = None
+        self.analysis_hide_job: Optional[str] = None
 
         self.root.title("足球状态机模拟器（阵型/策略可视化）")
         self.root.geometry("1680x980")
@@ -1522,12 +2090,167 @@ class MatchSimulatorUI:
             self._append_log("[调整] 本次未生效")
         self._render_full_snapshot()
 
+    @staticmethod
+    def _sanitize_llm_user_prompt(user_prompt: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned = dict(user_prompt)
+        cleaned.pop("output_json_schema", None)
+        requirements = cleaned.get("requirements", [])
+        if not isinstance(requirements, list):
+            requirements = [str(requirements)]
+        requirements.extend(
+            [
+                "请输出中文“战术分析报告”，不要输出JSON，不要输出Markdown代码块。",
+                "报告必须使用多行结构，并保留缩进，格式如下：",
+                "【总体结论】",
+                "  用2-3句总结比赛走势与A队执行效果。",
+                "【关键过程复盘】",
+                "  1. 时间点 + 事件 + 影响",
+                "  2. 时间点 + 事件 + 影响",
+                "【阵型与策略执行】",
+                "  说明A队阵型/策略是否有效，问题在哪里。",
+                "【改进建议】",
+                "  1. 可执行建议一",
+                "  2. 可执行建议二",
+                "禁止出现概率、百分比、命中率、P_等概率化字段表达。",
+                "字数控制在260-420字。",
+            ]
+        )
+        cleaned["requirements"] = requirements
+        return cleaned
+
+    def _build_llm_messages(self, report_type: str) -> List[Dict[str, str]]:
+        max_lines = 70 if report_type == "halftime" else 100
+        payload = self.engine.build_deepseek_prompt_payload(
+            report_type=report_type,
+            include_full_timeline=True,
+            timeline_scope="all",
+            compact_for_llm=True,
+            max_timeline_lines=max_lines,
+        )
+        system_prompt = str(payload["system_prompt"])
+        user_prompt = self._sanitize_llm_user_prompt(payload["user_prompt"])
+        return [
+            {
+                "role": "system",
+                "content": (
+                    f"{system_prompt}\n"
+                    "请始终使用中文，不要输出思考过程。"
+                    "输出必须是可阅读的多行战术分析报告，保留换行和缩进。"
+                    "不要输出任何概率化描述。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(user_prompt, ensure_ascii=False, separators=(",", ":")),
+            },
+        ]
+
+    def _call_llm_analysis(self, report_type: str) -> str:
+        if OpenAI is None:
+            return "未安装 openai 依赖，无法调用大模型。请先安装：pip install openai"
+        api_key = os.getenv("DASHSCOPE_API_KEY", self.LLM_DEFAULT_API_KEY)
+        client = OpenAI(api_key=api_key, base_url=self.LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model=self.LLM_MODEL,
+            messages=self._build_llm_messages(report_type),
+            extra_body={"enable_thinking": False},
+            stream=False,
+        )
+        content = ""
+        if resp.choices and resp.choices[0].message and resp.choices[0].message.content:
+            content = str(resp.choices[0].message.content).strip()
+        return content or "模型未返回有效内容。"
+
+    def _show_analysis_popup(self, title: str, content: str, auto_hide_ms: Optional[int] = None) -> None:
+        if self.analysis_popup is None or not self.analysis_popup.winfo_exists():
+            popup = tk.Toplevel(self.root)
+            popup.title(title)
+            popup.geometry("900x520")
+            popup.transient(self.root)
+
+            frame = ttk.Frame(popup, padding=10)
+            frame.pack(fill="both", expand=True)
+            frame.rowconfigure(1, weight=1)
+            frame.columnconfigure(0, weight=1)
+
+            header = ttk.Label(frame, text=title, font=("PingFang SC", 14, "bold"))
+            header.grid(row=0, column=0, sticky="w")
+
+            text = tk.Text(frame, wrap="word", font=("PingFang SC", 12))
+            text.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+            scroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+            scroll.grid(row=1, column=1, sticky="ns", pady=(8, 0))
+            text.configure(yscrollcommand=scroll.set, state="disabled")
+
+            self.analysis_popup = popup
+            self.analysis_text = text
+        else:
+            self.analysis_popup.title(title)
+
+        if self.analysis_text is not None:
+            self.analysis_text.configure(state="normal")
+            self.analysis_text.delete("1.0", "end")
+            self.analysis_text.insert("1.0", content)
+            self.analysis_text.configure(state="disabled")
+            self.analysis_text.see("1.0")
+
+        if self.analysis_popup is not None:
+            self.analysis_popup.deiconify()
+            self.analysis_popup.lift()
+
+        if self.analysis_hide_job is not None:
+            self.root.after_cancel(self.analysis_hide_job)
+            self.analysis_hide_job = None
+        if auto_hide_ms is not None:
+            self.analysis_hide_job = self.root.after(auto_hide_ms, self._hide_analysis_popup)
+
+    def _hide_analysis_popup(self) -> None:
+        self.analysis_hide_job = None
+        if self.analysis_popup is not None and self.analysis_popup.winfo_exists():
+            self.analysis_popup.withdraw()
+
+    def _run_analysis_async(self, report_type: str, phase_cn: str) -> None:
+        self._show_analysis_popup(f"{phase_cn}战术分析报告", "正在生成战术分析报告，请稍候...", auto_hide_ms=None)
+        self._append_log(f"[系统] 正在调用大模型生成{phase_cn}战术分析报告...")
+
+        def _worker() -> None:
+            try:
+                result = self._call_llm_analysis(report_type)
+            except Exception as exc:
+                result = f"生成{phase_cn}战术分析失败：{exc}"
+            self.root.after(0, lambda: self._on_analysis_ready(phase_cn, result))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_analysis_ready(self, phase_cn: str, text: str) -> None:
+        self._show_analysis_popup(
+            f"{phase_cn}战术分析报告",
+            text,
+            auto_hide_ms=self.ANALYSIS_POPUP_SHOW_MS,
+        )
+        self._append_log(f"[系统] {phase_cn}战术分析报告已生成并弹窗展示（15秒后自动隐藏）")
+
+    def _maybe_trigger_phase_analysis(self, before_seconds: int, after_seconds: int) -> None:
+        if (
+            not self.halftime_analysis_done
+            and before_seconds < self.HALF_TIME_SECONDS <= after_seconds
+            and after_seconds < self.engine.MATCH_DURATION_SECONDS
+        ):
+            self.halftime_analysis_done = True
+            self._run_analysis_async("halftime", "中场")
+        if not self.fulltime_analysis_done and before_seconds < self.engine.MATCH_DURATION_SECONDS <= after_seconds:
+            self.fulltime_analysis_done = True
+            self._run_analysis_async("fulltime", "终场")
+
     def manual_step(self) -> None:
+        before_seconds = self.engine.state.match_seconds
         report = self.engine.step_15min()
+        after_seconds = self.engine.state.match_seconds
         self.last_report = report
         self._append_log(f"【结果】[推进] {report.summary}")
         for line in report.detail_lines:
             self._append_log("  " + line)
+        self._maybe_trigger_phase_analysis(before_seconds, after_seconds)
         self._render_full_snapshot(report)
 
     def toggle_auto(self) -> None:
@@ -1571,6 +2294,9 @@ class MatchSimulatorUI:
             self.btn_start.configure(text=self._auto_idle_button_text())
         self.engine.reset()
         self.halftime_auto_paused = False
+        self.halftime_analysis_done = False
+        self.fulltime_analysis_done = False
+        self._hide_analysis_popup()
         for team in ["A", "B"]:
             getattr(self, f"var_form_{team}").set("4-4-2")
             getattr(self, f"var_{team}_height").set("默认平衡")

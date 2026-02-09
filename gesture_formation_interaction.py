@@ -5,6 +5,8 @@ import urllib.request
 import ssl
 import re
 import sys
+import random
+import itertools
 import faulthandler
 
 import cv2
@@ -64,9 +66,14 @@ PIL_FONT_CANDIDATES = [
 
 TEXT_COLOR = (255, 255, 255)
 SELECT_THRESHOLD = 30  # 像素距离阈值
-PLAYER_RADIUS = 8
-SELECTED_RADIUS = 12
-DRAGGING_RADIUS = 15
+PLAYER_RADIUS = 17
+SELECTED_RADIUS = 17
+DRAGGING_RADIUS = 22
+AVATAR_DIAMETER_FACTOR = 2.4
+PLAYER_AVATAR_DIR = "players"
+TEAM_A_AVATAR_FILES = [f"player{i}.png" for i in range(1, 12)]
+TEAM_B_AVATAR_FILES = [f"player{i}.png" for i in range(12, 23)]
+PENALTY_AREA_DEPTH_RATIO = 16.5 / 105.0
 
 PYGAME_FONT_PATHS = [
     "/System/Library/Fonts/PingFang.ttc",
@@ -249,18 +256,36 @@ def labels_for_role(role, count):
     mapping = mappings.get(role, {})
     return mapping.get(count, [f"{role}{i+1}" for i in range(count)])
 
+
+def lane_y_ratios(count):
+    """按人数返回更贴近比赛站位的纵向分布（0~1）"""
+    presets = {
+        1: [0.50],
+        2: [0.32, 0.68],
+        3: [0.23, 0.50, 0.77],
+        4: [0.16, 0.38, 0.62, 0.84],
+        5: [0.12, 0.31, 0.50, 0.69, 0.88],
+    }
+    if count in presets:
+        return presets[count]
+    return [(i + 1) / (count + 1) for i in range(count)]
+
 class Player:
     """球员类"""
-    def __init__(self, x, y, label, role):
+    def __init__(self, x, y, label, role, avatar_surface=None, team="A"):
         self.x = x
         self.y = y
         self.label = label
         self.role = role
+        self.avatar_surface = avatar_surface
+        self.team = team
         self.selected = False
         self.dragging = False
+        self.hovered = False
         self.original_x = x
         self.original_y = y
         self.out_of_bounds = False  # 出界标记
+        self._avatar_cache = {}
         
     def set_position(self, x, y, pitch_bounds):
         """设置球员位置，实现预警式边界限制"""
@@ -304,24 +329,42 @@ class Player:
     def draw(self, surface, font):
         """绘制球员"""
         radius = PLAYER_RADIUS
-        color = PLAYER_COLOR
-        
+        border_color = (30, 30, 30)
+        border_width = 2
         if self.dragging:
             radius = DRAGGING_RADIUS
-            color = DRAGGING_PLAYER_COLOR
-        elif self.selected:
-            radius = SELECTED_RADIUS
-            color = SELECTED_PLAYER_COLOR
-            
-        # 绘制球员圆圈
-        pygame.draw.circle(surface, color, (int(self.x), int(self.y)), radius)
-        pygame.draw.circle(surface, (30, 30, 30), (int(self.x), int(self.y)), radius, 2)
+            border_color = DRAGGING_PLAYER_COLOR
+            border_width = 3
+        elif self.hovered:
+            border_color = SELECTED_PLAYER_COLOR
+            border_width = 3
+
+        draw_pos = (int(self.x), int(self.y))
+
+        # 优先绘制头像（A队），缺失时回退圆点
+        if self.avatar_surface is not None:
+            diameter = max(18, int(radius * AVATAR_DIAMETER_FACTOR))
+            if diameter not in self._avatar_cache:
+                self._avatar_cache[diameter] = pygame.transform.smoothscale(
+                    self.avatar_surface, (diameter, diameter)
+                )
+            avatar = self._avatar_cache[diameter]
+            avatar_rect = avatar.get_rect(center=draw_pos)
+            surface.blit(avatar, avatar_rect)
+            ring_radius = max(radius, diameter // 2)
+            pygame.draw.circle(surface, border_color, draw_pos, ring_radius, border_width)
+            pygame.draw.circle(surface, (30, 30, 30), draw_pos, ring_radius + 1, 1)
+        else:
+            fill_color = PLAYER_COLOR if not self.dragging else DRAGGING_PLAYER_COLOR
+            pygame.draw.circle(surface, fill_color, draw_pos, radius)
+            pygame.draw.circle(surface, border_color, draw_pos, radius, border_width)
         
         # 绘制标签
         text = font.render(self.label, True, (245, 245, 245))
-        text_rect = text.get_rect(center=(int(self.x), int(self.y - radius - 10)))
+        label_offset = radius + 14
+        text_rect = text.get_rect(center=(int(self.x), int(self.y - label_offset)))
         if text_rect.top < 2:
-            text_rect = text.get_rect(center=(int(self.x), int(self.y + radius + 10)))
+            text_rect = text.get_rect(center=(int(self.x), int(self.y + label_offset)))
         surface.blit(text, text_rect)
 
 class GestureFormationApp:
@@ -341,10 +384,14 @@ class GestureFormationApp:
         # 加载数据
         self.formations = parse_formations_md(FORMATIONS_MD)
         self.formation_names = list(self.formations.keys()) if self.formations else ["4-4-2", "4-3-3", "4-2-3-1"]
-        self.selected_formation = self.formation_names[0]
+        self.default_formation = self.pick_default_formation()
+        self.selected_formation_a = self.default_formation
+        self.selected_formation_b = self.default_formation
+        self.team_a_avatars = self.load_team_avatars(TEAM_A_AVATAR_FILES)
+        self.team_b_avatars = self.load_team_avatars(TEAM_B_AVATAR_FILES)
         
         # 球场边界（初始默认值，基于图像实际边界）
-        player_radius = 15
+        player_radius = DRAGGING_RADIUS + 2
         # 默认使用标准比例计算（假设图像为16:9）
         default_img_w, default_img_h = 800, 450
         area_w = WINDOW_WIDTH - 320 - 20
@@ -453,9 +500,16 @@ class GestureFormationApp:
         self.smooth_movement_active = False
         self.movement_targets = {}  # 存储每个球员的目标位置
         self.movement_speed = 3.0   # 基础移动速度（像素/帧）
-        self.movement_duration_seconds = 3.0  # 阵型调整总时长
+        self.movement_duration_seconds = 1.5  # 阵型调整总时长
         self.movement_completed_callback = None
         self.animation_progress = {}  # 存储每个球员的动画进度(0.0-1.0)
+        
+        # B队自动换阵：每10秒随机切换一次（与A队独立）
+        self.team_b_auto_switch_interval = 10.0
+        self.last_team_b_auto_switch_time = time.time()
+        self.pending_team_b_target_formation = None
+        # A队手动调整后待确认锁：未OK前冻结B队自动换阵
+        self.a_position_dirty_pending_ok = False
         
     def initialize_hand_detector(self):
         """初始化手势检测器"""
@@ -503,63 +557,196 @@ class GestureFormationApp:
             import traceback
             traceback.print_exc()
             return None
-    
-    def create_players(self):
-        """创建球员点位"""
-        self.players = []
-        rows = parse_formation_numbers(self.selected_formation)
-        if not rows:
-            return
-            
-        roles = roles_for_rows(rows)
-        
-        # 计算球场区域和边界（基于实际图像边界）
+
+    def pick_default_formation(self):
+        """优先选择4-4-2作为默认阵型"""
+        preferred = ["4-4-2", "4-4-2：经典平衡，双前锋。"]
+        for name in preferred:
+            if name in self.formation_names:
+                return name
+        for name in self.formation_names:
+            nums = parse_formation_numbers(name)
+            if nums == [4, 4, 2]:
+                return name
+        return self.formation_names[0] if self.formation_names else "4-4-2"
+
+    def load_team_avatars(self, avatar_files):
+        """加载指定队伍头像"""
+        avatars = []
+        for filename in avatar_files:
+            path = os.path.join(PLAYER_AVATAR_DIR, filename)
+            if not os.path.exists(path):
+                avatars.append(None)
+                continue
+            try:
+                img = pygame.image.load(path).convert_alpha()
+                avatars.append(img)
+            except Exception as e:
+                print(f"加载头像失败: {path} ({e})")
+                avatars.append(None)
+        return avatars
+
+    def _compute_pitch_bounds(self):
+        """计算球场边界（基于实际图像边界）"""
+        _, image_rect = self._get_pitch_rects()
+        player_radius = DRAGGING_RADIUS + 2
+        self.pitch_bounds = (
+            image_rect.left + player_radius,
+            image_rect.top + player_radius,
+            image_rect.right - player_radius,
+            image_rect.bottom - player_radius,
+        )
+
+    def _get_pitch_rects(self):
+        """返回球场容器矩形与等比背景矩形"""
         sw, sh = self.screen.get_size()
         sidebar_w = max(320, int(sw * 0.28))
-        
-        # 计算球场图像在窗口中的实际位置和尺寸
-        area_w = sw - sidebar_w - 20  # 球场区域宽度
-        area_h = sh - 20              # 球场区域高度
+        pitch_rect = pygame.Rect(10, 10, sw - sidebar_w - 20, sh - 20)
+
         img_w, img_h = self.ground_size
-        margin = 10  # 与draw_pitch_area保持一致
-        
-        # 使用compute_image_rect计算实际图像边界
-        img_x, img_y, img_width, img_height = compute_image_rect(area_w, area_h, img_w, img_h, margin)
-        
-        # 调整到窗口坐标系（加上左侧偏移）
-        left_offset = 10  # 与draw_pitch_area的pygame.Rect(10, 10, ...)对齐
-        top_offset = 10
-        
-        # 设置精确的球员移动边界（基于实际图像边界）
-        player_radius = 15  # 球员最大半径
-        self.pitch_bounds = (
-            left_offset + img_x + player_radius,                    # min_x
-            top_offset + img_y + player_radius,                     # min_y
-            left_offset + img_x + img_width - player_radius,       # max_x
-            top_offset + img_y + img_height - player_radius         # max_y
+        margin = 10
+        fit_x, fit_y, fit_w, fit_h = compute_image_rect(
+            pitch_rect.width, pitch_rect.height, img_w, img_h, margin
         )
-        
-        # 门将位置（在边界内）
-        gk_x = self.pitch_bounds[0] + 20  # 左边界内20像素
-        gk_y = (self.pitch_bounds[1] + self.pitch_bounds[3]) // 2  # 垂直居中
-        self.players.append(Player(gk_x, gk_y, "门将", "GK"))
-        
-        # 其他球员
+        image_rect = pygame.Rect(
+            pitch_rect.x + fit_x,
+            pitch_rect.y + fit_y,
+            fit_w,
+            fit_h,
+        )
+        return pitch_rect, image_rect
+
+    def _compute_interleaved_line_positions(self, rows_a, rows_b):
+        """计算A/B两队交错且全局等间距的列X位置（考虑列数不一致）"""
+        min_x, _min_y, max_x, _max_y = self.pitch_bounds
+        pitch_w = max_x - min_x
+        margin_x = pitch_w * 0.06
+        count_a = len(rows_a)
+        count_b = len(rows_b)
+        total = count_a + count_b
+        if total <= 0:
+            return [], []
+
+        # 使用“左禁区线到右禁区线”之间的区域作为阵线横向范围
+        penalty_depth = pitch_w * PENALTY_AREA_DEPTH_RATIO
+        inner_pad = max(8.0, pitch_w * 0.01)
+        span_left = min_x + penalty_depth + inner_pad
+        span_right = max_x - penalty_depth - inner_pad
+        if span_right <= span_left:
+            # 极端窗口下兜底
+            span_left = min_x + max(margin_x * 1.2, pitch_w * 0.18)
+            span_right = max_x - max(margin_x * 1.2, pitch_w * 0.18)
+
+        if total == 1:
+            slots = [(span_left + span_right) / 2.0]
+        else:
+            gap = (span_right - span_left) / (total - 1)
+            slots = [span_left + i * gap for i in range(total)]
+
+        # 左到右分配槽位归属：
+        # 先尽量AB交错；多余列放回本方侧（A放左端，B放右端）
+        pair_count = min(count_a, count_b)
+        core = []
+        for _ in range(pair_count):
+            core.append("A")
+            core.append("B")
+        extra_a = ["A"] * (count_a - pair_count)
+        extra_b = ["B"] * (count_b - pair_count)
+        owners = extra_a + core + extra_b
+
+        # owners长度应与slots一致
+        owners = owners[:len(slots)]
+        a_slot_idx = [i for i, o in enumerate(owners) if o == "A"][:count_a]
+        b_slot_idx = [i for i, o in enumerate(owners) if o == "B"][:count_b]
+
+        # A: 防线->锋线 = 左->右
+        a_lines = [slots[i] for i in sorted(a_slot_idx)]
+        # B: 防线->锋线 = 右->左
+        b_lines = [slots[i] for i in sorted(b_slot_idx, reverse=True)]
+        return a_lines, b_lines
+
+    def _build_team_players(self, team_name, formation_name, avatars, attack_to_right=True, line_positions=None):
+        """为单支球队生成阵型点位"""
+        rows = parse_formation_numbers(formation_name)
+        if not rows:
+            rows = [4, 4, 2]
+        roles = roles_for_rows(rows)
+        players = []
+        player_idx = 0
+
+        min_x, min_y, max_x, max_y = self.pitch_bounds
+        pitch_w = max_x - min_x
+        pitch_h = max_y - min_y
+        margin_x = pitch_w * 0.06
+        margin_y = pitch_h * 0.06
+
+        gk_ratio = 0.04
+        gk_x = min_x + int(pitch_w * gk_ratio) if attack_to_right else max_x - int(pitch_w * gk_ratio)
+        gk_y = (min_y + max_y) // 2
+        gk_avatar = avatars[player_idx] if player_idx < len(avatars) else None
+        players.append(Player(gk_x, gk_y, "门将", "GK", gk_avatar, team=team_name))
+        player_idx += 1
+
         total_lines = len(rows)
-        pitch_w = self.pitch_bounds[2] - self.pitch_bounds[0]  # max_x - min_x
-        pitch_h = self.pitch_bounds[3] - self.pitch_bounds[1]  # max_y - min_y
-        margin_x = pitch_w * 0.1
-        margin_y = pitch_h * 0.1
-        start_x = self.pitch_bounds[0] + margin_x * 2  # min_x + margin
-        end_x = self.pitch_bounds[0] + pitch_w - margin_x * 1.5
-        
+        penalty_depth = pitch_w * PENALTY_AREA_DEPTH_RATIO
+        inner_pad = max(8.0, pitch_w * 0.01)
+        line_start = min_x + penalty_depth + inner_pad
+        line_end = max_x - penalty_depth - inner_pad
+        if line_end <= line_start:
+            line_start = min_x + margin_x * 1.2
+            line_end = min_x + pitch_w - margin_x * 0.8
+
         for i, count in enumerate(rows):
-            line_x = start_x + (end_x - start_x) * (i + 1) / (total_lines + 1)
+            if line_positions and i < len(line_positions):
+                line_x = line_positions[i]
+            else:
+                base_x = line_start + (line_end - line_start) * (i + 1) / (total_lines + 1)
+                line_x = base_x if attack_to_right else (min_x + max_x - base_x)
             labels = labels_for_role(roles[i] if i < len(roles) else "MID", count)
+            y_ratios = lane_y_ratios(count)
             for j in range(count):
-                y = self.pitch_bounds[1] + margin_y + (pitch_h - 2 * margin_y) * (j + 1) / (count + 1)  # min_y + ...
+                y_ratio = y_ratios[j] if j < len(y_ratios) else (j + 1) / (count + 1)
+                y = min_y + margin_y + (pitch_h - 2 * margin_y) * y_ratio
+                # 两队头像交错：B队纵向轻微偏移，避免完全重合感
+                if team_name == "B":
+                    y += 6 if (j % 2 == 0) else -6
                 label = labels[j] if j < len(labels) else f"P{j + 1}"
-                self.players.append(Player(line_x, y, label, roles[i]))
+                avatar = avatars[player_idx] if player_idx < len(avatars) else None
+                players.append(Player(line_x, y, label, roles[i], avatar, team=team_name))
+                player_idx += 1
+
+        return players
+
+    def create_players(self):
+        """创建A/B两队球员点位，并交错组织绘制顺序"""
+        self.players = []
+        self._compute_pitch_bounds()
+        rows_a = parse_formation_numbers(self.selected_formation_a) or [4, 4, 2]
+        rows_b = parse_formation_numbers(self.selected_formation_b) or [4, 4, 2]
+        line_x_a, line_x_b = self._compute_interleaved_line_positions(rows_a, rows_b)
+
+        team_a_players = self._build_team_players(
+            team_name="A",
+            formation_name=self.selected_formation_a,
+            avatars=self.team_a_avatars,
+            attack_to_right=True,
+            line_positions=line_x_a,
+        )
+        team_b_players = self._build_team_players(
+            team_name="B",
+            formation_name=self.selected_formation_b,
+            avatars=self.team_b_avatars,
+            attack_to_right=False,
+            line_positions=line_x_b,
+        )
+
+        # 交错顺序：A1, B1, A2, B2...
+        max_len = max(len(team_a_players), len(team_b_players))
+        for i in range(max_len):
+            if i < len(team_a_players):
+                self.players.append(team_a_players[i])
+            if i < len(team_b_players):
+                self.players.append(team_b_players[i])
     
     def draw_hand_skeleton(self, frame, keypoints):
         """在图像上绘制手部骨架"""
@@ -863,10 +1050,10 @@ class GestureFormationApp:
                 
                 if target_formation:
                     # 记录转换前阵型
-                    prev_formation = self.selected_formation
+                    prev_formation = self.selected_formation_a
                     
-                    # 如果前后阵型一致，不触发调整流程
-                    if prev_formation == target_formation:
+                    # 如果前后阵型一致且无待确认手动改动，不触发调整流程
+                    if prev_formation == target_formation and not self.a_position_dirty_pending_ok:
                         self.confirmation_message = f"无需调整（已是 {target_formation}）"
                         self.confirmation_timer = 180  # 显示3秒
                         self.last_ok_gesture_time = current_time
@@ -878,19 +1065,27 @@ class GestureFormationApp:
                         self.ok_hold_elapsed = 0.0
                         return
                     
-                    # 显示确认消息与调整过程
+                    # 显示确认消息与调整过程（OK后同步A/B，但不强制同阵型）
                     self.last_adjustment_from = prev_formation
                     self.last_adjustment_to = target_formation
-                    self.confirmation_message = f"{prev_formation} → {target_formation}"
+                    b_target = self.pending_team_b_target_formation or self.selected_formation_b
+                    self.confirmation_message = f"确认同步: A→{target_formation} | B→{b_target}"
                     self.confirmation_timer = 240  # 显示4秒
                     self.last_ok_gesture_time = current_time
                     
-                    # 执行阵型调整
-                    success = self.adjust_formation_to_standard(target_formation)
+                    # 执行阵型调整：同步A队与B队（B优先使用待执行目标）
+                    success = self.adjust_formation_to_standard(
+                        target_formation,
+                        team_name="both",
+                        target_formation_b=b_target,
+                    )
                     if success:
-                        print(f"阵型已调整为标准 {target_formation} 阵型")
+                        print(f"A/B阵型已同步调整: A={target_formation}, B={b_target}")
+                        self.a_position_dirty_pending_ok = False
+                        self.pending_team_b_target_formation = None
+                        self.last_team_b_auto_switch_time = current_time
                     else:
-                        print(f"阵型调整失败: {target_formation}")
+                        print(f"A/B阵型同步调整失败: {target_formation}")
                 else:
                     # 无法识别或找不到对应标准阵型
                     self.confirmation_message = "没有匹配阵型"
@@ -974,6 +1169,8 @@ class GestureFormationApp:
             self.confirmation_timer -= 1
         
         if not self.hand_detected:
+            for player in self.players:
+                player.hovered = False
             # 没有检测到手时增加丢失计数
             self.lost_tracking_count += 1
             
@@ -991,20 +1188,32 @@ class GestureFormationApp:
             # 检测到手时重置丢失计数
             self.lost_tracking_count = 0
         
-        current_time = time.time()
-        
-        # 检查冷却时间
-        if current_time - self.last_gesture_time < self.gesture_cooldown:
-            return
-            
-        # 检查是否有球员被选中
+        # 检查是否有球员被选中（仅A队可交互）
         hovered_player = None
         for player in self.players:
+            if player.team != "A":
+                continue
             if player.is_hovered(self.hand_x, self.hand_y):
                 hovered_player = player
                 break
+        for player in self.players:
+            player.hovered = (player == hovered_player and player.team == "A")
+
+        current_time = time.time()
+        
+        # 检查冷却时间（视觉高亮已更新）
+        if current_time - self.last_gesture_time < self.gesture_cooldown:
+            return
         
         if self.dragging_player:
+            # 防御性处理：右侧B队不允许被拖拽
+            if self.dragging_player.team != "A":
+                self.dragging_player.dragging = False
+                self.dragging_player = None
+                if self.selected_player and self.selected_player.team != "A":
+                    self.selected_player.selected = False
+                    self.selected_player = None
+                return
             # 正在拖拽球员
             if not self.is_grabbing:  # 松开手势
                 self.dragging_player.dragging = False
@@ -1014,6 +1223,10 @@ class GestureFormationApp:
                 # 实现预警式边界限制
                 old_x, old_y = self.dragging_player.x, self.dragging_player.y
                 success = self.dragging_player.set_position(self.hand_x, self.hand_y, self.pitch_bounds)
+                if success and self.dragging_player.team == "A":
+                    moved = math.hypot(self.dragging_player.x - old_x, self.dragging_player.y - old_y)
+                    if moved > 0.1:
+                        self.a_position_dirty_pending_ok = True
                 
                 # 检查是否进入预警区域或出界
                 min_x, min_y, max_x, max_y = self.pitch_bounds
@@ -1053,21 +1266,22 @@ class GestureFormationApp:
     
     def draw_pitch_area(self):
         """绘制球场区域"""
-        sw, sh = self.screen.get_size()
-        sidebar_w = max(320, int(sw * 0.28))
-        pitch_rect = pygame.Rect(10, 10, sw - sidebar_w - 20, sh - 20)
+        pitch_rect, image_rect = self._get_pitch_rects()
         
         # 绘制背景
         if self.ground_img is not None:
-            # 缩放背景图像以适应球场区域
-            scaled_img = pygame.transform.smoothscale(self.ground_img, 
-                                                    (pitch_rect.width, pitch_rect.height))
-            self.screen.blit(scaled_img, pitch_rect)
+            # 先绘制容器底色，再将背景图等比缩放后居中显示
+            pygame.draw.rect(self.screen, (18, 18, 18), pitch_rect)
+            scaled_img = pygame.transform.smoothscale(
+                self.ground_img, (image_rect.width, image_rect.height)
+            )
+            self.screen.blit(scaled_img, image_rect)
         else:
             pygame.draw.rect(self.screen, (34, 139, 34), pitch_rect)
         
-        # 绘制边界
+        # 绘制边界（外容器+实际球场图像区域）
         pygame.draw.rect(self.screen, (255, 255, 255), pitch_rect, 2)
+        pygame.draw.rect(self.screen, (210, 210, 210), image_rect, 1)
         
         return pitch_rect
 
@@ -1178,8 +1392,8 @@ class GestureFormationApp:
         if not self.players:
             return "未知阵型"
         
-        # 获取除门将外的球员
-        field_players = [p for p in self.players if p.role != "GK"]
+        # 仅识别A队（避免双队同时在场导致识别失真）
+        field_players = [p for p in self.players if p.team == "A" and p.role != "GK"]
         if len(field_players) < 6:  # 至少需要6个场上球员
             return "阵容不完整"
         
@@ -1704,14 +1918,30 @@ class GestureFormationApp:
         
         return None
     
-    def adjust_formation_to_standard(self, target_formation):
-        """将当前阵型调整为标准阵型（带平滑移动）"""
+    def adjust_formation_to_standard(self, target_formation, team_name="A", target_formation_b=None):
+        """将指定队伍调整为标准阵型（带平滑移动）"""
+        if team_name not in ("A", "B", "both"):
+            return False
         if not target_formation or target_formation not in self.formation_names:
             return False
-            
-        # 保存当前阵型
-        old_formation = self.selected_formation
-        self.selected_formation = target_formation
+
+        if team_name == "A":
+            old_formation = self.selected_formation_a
+            target_map = {"A": target_formation}
+            self.selected_formation_a = target_map["A"]
+            target_teams = ("A",)
+        elif team_name == "B":
+            old_formation = self.selected_formation_b
+            target_map = {"B": target_formation}
+            self.selected_formation_b = target_map["B"]
+            target_teams = ("B",)
+        else:
+            old_formation = f"A:{self.selected_formation_a} | B:{self.selected_formation_b}"
+            b_target = target_formation_b if target_formation_b in self.formation_names else target_formation
+            target_map = {"A": target_formation, "B": b_target}
+            self.selected_formation_a = target_map["A"]
+            self.selected_formation_b = target_map["B"]
+            target_teams = ("A", "B")
         
         # 保存当前球员位置
         old_players_data = []
@@ -1719,6 +1949,7 @@ class GestureFormationApp:
             old_players_data.append({
                 'label': player.label,
                 'role': player.role,
+                'team': player.team,
                 'x': player.x,
                 'y': player.y,
                 'selected': player.selected,
@@ -1727,55 +1958,216 @@ class GestureFormationApp:
         
         # 重新创建标准阵型的球员布局
         self.create_players()
-        
+
         # 建立球员匹配和设置移动目标
         self.movement_targets = {}
-        matched_players = set()  # 记录已匹配的旧球员索引
-        
-        # 为每个新球员寻找最佳匹配的旧球员
+        self.selected_player = None
+        self.dragging_player = None
+        assigned_new = set()
+        assigned_old = set()
+
+        def bind_assignment(new_idx, old_idx):
+            new_player = self.players[new_idx]
+            old_data = old_players_data[old_idx]
+            self.movement_targets[new_idx] = {
+                'target_x': new_player.x,
+                'target_y': new_player.y,
+                'start_x': old_data['x'],
+                'start_y': old_data['y']
+            }
+            new_player.selected = old_data['selected']
+            new_player.dragging = old_data['dragging']
+            new_player.hovered = False
+            if new_player.selected:
+                self.selected_player = new_player
+            if new_player.dragging:
+                self.dragging_player = new_player
+            assigned_new.add(new_idx)
+            assigned_old.add(old_idx)
+
+        # 优先固定门将匹配（仅目标球队）
+        if self.players and old_players_data:
+            for current_team in target_teams:
+                gk_new_idx = None
+                gk_old_idx = None
+                for idx, player in enumerate(self.players):
+                    if player.team == current_team and player.role == "GK":
+                        gk_new_idx = idx
+                        break
+                for idx, old in enumerate(old_players_data):
+                    if old.get("team") == current_team and old.get("role") == "GK":
+                        gk_old_idx = idx
+                        break
+                if gk_new_idx is not None and gk_old_idx is not None:
+                    bind_assignment(gk_new_idx, gk_old_idx)
+
+        def solve_team_column_min_cost(team_name):
+            """
+            按列求最小总位移：
+            1) 以当前所有球员坐标作为起点
+            2) 按新阵型列划分目标位
+            3) 在“列”为统计范围下，求全队最小移动量之和
+            """
+            current_target_formation = target_map.get(team_name, target_formation)
+            target_rows = parse_formation_numbers(current_target_formation)
+            if not target_rows:
+                return
+
+            new_team_field_indices = [
+                i for i, p in enumerate(self.players)
+                if p.team == team_name and p.role != "GK"
+            ]
+            old_team_field_indices = [
+                i for i, old in enumerate(old_players_data)
+                if old.get("team") == team_name and old.get("role") != "GK"
+            ]
+            if not new_team_field_indices or not old_team_field_indices:
+                return
+
+            # 按新阵型划分“新列目标位”
+            new_columns = []
+            cursor = 0
+            for c in target_rows:
+                col = new_team_field_indices[cursor: cursor + c]
+                if col:
+                    new_columns.append(col)
+                cursor += c
+            if not new_columns:
+                return
+
+            n_old = len(old_team_field_indices)
+            n_new = sum(len(col) for col in new_columns)
+            if n_old != n_new:
+                # 兜底：人数不一致时退回最近邻（极少见）
+                remaining_old = set(old_team_field_indices)
+                for col in new_columns:
+                    for new_idx in col:
+                        nx, ny = self.players[new_idx].x, self.players[new_idx].y
+                        old_idx = min(
+                            remaining_old,
+                            key=lambda oi: (nx - old_players_data[oi]['x']) ** 2 + (ny - old_players_data[oi]['y']) ** 2
+                        )
+                        bind_assignment(new_idx, old_idx)
+                        remaining_old.remove(old_idx)
+                return
+
+            # 旧球员本地编号(0..n_old-1) -> 全局 old_idx
+            local_to_old = list(old_team_field_indices)
+            all_local = list(range(n_old))
+
+            # 预计算每列的“子集最小代价 + 具体映射”
+            # key: (col_idx, subset_mask) -> (cost, pairs[(new_idx, old_global_idx), ...])
+            col_cost_cache = {}
+            for col_idx, col_new_indices in enumerate(new_columns):
+                k = len(col_new_indices)
+                targets = [(self.players[ni].x, self.players[ni].y) for ni in col_new_indices]
+
+                for subset_local in itertools.combinations(all_local, k):
+                    subset_mask = 0
+                    for li in subset_local:
+                        subset_mask |= (1 << li)
+
+                    # 在该列内，求“当前这k名球员 -> 这k个目标位”的最小匹配
+                    best_cost = None
+                    best_pairs = None
+                    for perm in itertools.permutations(range(k), k):
+                        total = 0.0
+                        pairs = []
+                        for src_pos, target_pos in enumerate(perm):
+                            local_old_idx = subset_local[src_pos]
+                            old_global_idx = local_to_old[local_old_idx]
+                            ox = old_players_data[old_global_idx]['x']
+                            oy = old_players_data[old_global_idx]['y']
+                            tx, ty = targets[target_pos]
+                            dist = math.hypot(tx - ox, ty - oy)
+                            total += dist
+                            pairs.append((col_new_indices[target_pos], old_global_idx))
+                        if best_cost is None or total < best_cost:
+                            best_cost = total
+                            best_pairs = pairs
+
+                    col_cost_cache[(col_idx, subset_mask)] = (best_cost, best_pairs)
+
+            # DP：按列分配子集，最小化全队总位移
+            # dp[col_i][used_mask] = cost
+            full_mask = (1 << n_old) - 1
+            dp = {0: {0: 0.0}}
+            prev = {}  # (col_i, used_mask) -> (prev_mask, subset_mask, pairs)
+
+            for col_i, col_new_indices in enumerate(new_columns, start=1):
+                k = len(col_new_indices)
+                dp[col_i] = {}
+                for used_mask, used_cost in dp[col_i - 1].items():
+                    remain = [li for li in all_local if not (used_mask & (1 << li))]
+                    for subset_local in itertools.combinations(remain, k):
+                        subset_mask = 0
+                        for li in subset_local:
+                            subset_mask |= (1 << li)
+                        next_mask = used_mask | subset_mask
+
+                        cache_key = (col_i - 1, subset_mask)
+                        if cache_key not in col_cost_cache:
+                            continue
+                        col_cost, pairs = col_cost_cache[cache_key]
+                        cand = used_cost + col_cost
+                        if next_mask not in dp[col_i] or cand < dp[col_i][next_mask]:
+                            dp[col_i][next_mask] = cand
+                            prev[(col_i, next_mask)] = (used_mask, subset_mask, pairs)
+
+            if len(new_columns) not in dp or full_mask not in dp[len(new_columns)]:
+                # 理论上不会发生，兜底回最近邻
+                remaining_old = set(old_team_field_indices)
+                for col in new_columns:
+                    for new_idx in col:
+                        nx, ny = self.players[new_idx].x, self.players[new_idx].y
+                        old_idx = min(
+                            remaining_old,
+                            key=lambda oi: (nx - old_players_data[oi]['x']) ** 2 + (ny - old_players_data[oi]['y']) ** 2
+                        )
+                        bind_assignment(new_idx, old_idx)
+                        remaining_old.remove(old_idx)
+                return
+
+            # 回溯最优映射并绑定
+            cur_mask = full_mask
+            for col_i in range(len(new_columns), 0, -1):
+                key = (col_i, cur_mask)
+                if key not in prev:
+                    continue
+                prev_mask, _subset_mask, pairs = prev[key]
+                for new_idx, old_global_idx in pairs:
+                    if new_idx not in assigned_new and old_global_idx not in assigned_old:
+                        bind_assignment(new_idx, old_global_idx)
+                cur_mask = prev_mask
+
+        # 目标队执行“按列最小总位移”匹配
+        for current_team in target_teams:
+            solve_team_column_min_cost(current_team)
+        if team_name == "both":
+            print(
+                "开始动画调整阵型(1.5秒/按列最小总位移): "
+                f"A {old_formation} → {target_map['A']} | B → {target_map['B']}"
+            )
+        else:
+            print(f"开始动画调整阵型(1.5秒/按列最小总位移): {team_name}队 {old_formation} → {target_formation}")
+
+        # 兜底：若存在未匹配位置，保持原地
         for i, new_player in enumerate(self.players):
-            best_match_idx = -1
-            best_distance = float('inf')
-            
-            # 寻找标签和角色都匹配的球员
-            for j, old_data in enumerate(old_players_data):
-                if j not in matched_players and \
-                   new_player.label == old_data['label'] and \
-                   new_player.role == old_data['role']:
-                    distance = math.sqrt((new_player.x - old_data['x'])**2 + 
-                                       (new_player.y - old_data['y'])**2)
-                    if distance < best_distance:
-                        best_distance = distance
-                        best_match_idx = j
-            
-            # 如果找到匹配，设置移动目标
-            if best_match_idx != -1:
-                old_data = old_players_data[best_match_idx]
-                self.movement_targets[i] = {
-                    'target_x': new_player.x,
-                    'target_y': new_player.y,
-                    'start_x': old_data['x'],
-                    'start_y': old_data['y']
-                }
-                # 恢复状态信息
-                new_player.selected = old_data['selected']
-                new_player.dragging = old_data['dragging']
-                matched_players.add(best_match_idx)
-            else:
-                # 没有匹配的新球员，从当前位置开始移动
-                self.movement_targets[i] = {
-                    'target_x': new_player.x,
-                    'target_y': new_player.y,
-                    'start_x': new_player.x,
-                    'start_y': new_player.y
-                }
-        
+            if i in assigned_new:
+                continue
+            self.movement_targets[i] = {
+                'target_x': new_player.x,
+                'target_y': new_player.y,
+                'start_x': new_player.x,
+                'start_y': new_player.y
+            }
+            new_player.hovered = False
+
         # 初始化动画进度
         self.animation_progress = {i: 0.0 for i in self.movement_targets.keys()}
-        
+
         # 启动平滑移动
         self.smooth_movement_active = True
-        print(f"开始动画调整阵型: {old_formation} → {target_formation}")
         return True
     
     def draw_no_camera_warning(self):
@@ -1799,6 +2191,46 @@ class GestureFormationApp:
         hint_text = "请检查摄像头连接和权限"
         hint_surface = self.font_small.render(hint_text, True, (180, 180, 180))
         self.screen.blit(hint_surface, (sw - 290, sh - 40))
+
+    def maybe_trigger_team_b_auto_switch(self):
+        """B队每10秒自动随机切换阵型（与A队独立）"""
+        now = time.time()
+        if now - self.last_team_b_auto_switch_time < self.team_b_auto_switch_interval:
+            return
+
+        candidates = []
+        for name in self.formation_names:
+            nums = parse_formation_numbers(name)
+            if not nums:
+                continue
+            if name == self.selected_formation_b:
+                continue
+            candidates.append(name)
+        if not candidates:
+            return
+
+        target = random.choice(candidates)
+        self.last_team_b_auto_switch_time = now
+        should_delay_animation = (
+            self.a_position_dirty_pending_ok
+            or (self.dragging_player is not None and self.dragging_player.team == "A")
+            or self.smooth_movement_active
+        )
+        if should_delay_animation:
+            # 延迟期：继续每10秒更新目标，但不立即播动画
+            self.pending_team_b_target_formation = target
+            self.confirmation_message = f"B队待执行阵型: {target}（等待A队OK后执行）"
+            self.confirmation_timer = 150
+            print(f"[B队待执行] 已记录最新目标阵型: {target}")
+            return
+
+        self.confirmation_message = f"B队自动切换: {self.selected_formation_b} → {target}"
+        self.confirmation_timer = 180
+        ok = self.adjust_formation_to_standard(target, team_name="B")
+        if ok:
+            print(f"[B队自动切换] {target}")
+        else:
+            print(f"[B队自动切换] 切换失败: {target}")
     
     def show_out_of_bounds_warning(self):
         """显示出界警告（包括预警提示）"""
@@ -1865,6 +2297,20 @@ class GestureFormationApp:
                 ok_text = f"OK手势: {'是' if is_ok_gesture else '否'}"
                 ok_surface = self.font_small.render(ok_text, True, (180, 180, 180))
                 self.screen.blit(ok_surface, (20, 90))
+
+        form_text = f"A队阵型: {self.selected_formation_a} | B队阵型: {self.selected_formation_b}"
+        form_surface = self.font_small.render(form_text, True, (200, 220, 200))
+        self.screen.blit(form_surface, (20, 112))
+
+        elapsed = time.time() - self.last_team_b_auto_switch_time
+        left_sec = max(0.0, self.team_b_auto_switch_interval - elapsed)
+        if self.a_position_dirty_pending_ok:
+            pending = self.pending_team_b_target_formation or "无"
+            auto_text = f"B队自动换阵: 已冻结（待执行={pending}）"
+        else:
+            auto_text = f"B队自动换阵倒计时: {left_sec:.1f}s"
+        auto_surface = self.font_small.render(auto_text, True, (180, 180, 210))
+        self.screen.blit(auto_surface, (20, 132))
         
         # 出界警告
         if self.out_of_bounds_timer > 0:
@@ -1875,7 +2321,7 @@ class GestureFormationApp:
             self.out_of_bounds_timer -= 1
         
         # 交互提示
-        hint_text = "提示: 接近边界会有预警，触线即限制移动"
+        hint_text = "提示: A队手动调整后需OK确认，确认时A/B同步调整"
         hint_surface = self.font_small.render(hint_text, True, (150, 150, 150))
         self.screen.blit(hint_surface, (20, sh - 30))
     
@@ -1959,6 +2405,9 @@ class GestureFormationApp:
                 
                 # 显示提示信息
                 self.draw_no_camera_warning()
+
+            # B队每10秒自动随机切换阵型（独立于A队）
+            self.maybe_trigger_team_b_auto_switch()
             
             # 绘制球场区域（占用更多空间）
             pitch_rect = self.draw_pitch_area()
