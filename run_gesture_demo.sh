@@ -7,7 +7,7 @@ VENV_DIR="$ROOT_DIR/.venv_gesture"
 if [ ! -d "$VENV_DIR" ]; then
   python3.11 -m venv "$VENV_DIR"
   "$VENV_DIR/bin/python" -m pip install -U pip
-  "$VENV_DIR/bin/python" -m pip install mediapipe opencv-python pillow certifi
+  "$VENV_DIR/bin/python" -m pip install mediapipe opencv-python pillow certifi openai
 fi
 
-exec "$VENV_DIR/bin/python" "$ROOT_DIR/gesture_hand_demo.py"
+exec "$VENV_DIR/bin/python" "$ROOT_DIR/fusion_pygame_simulator.py"
